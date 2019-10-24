@@ -9,9 +9,19 @@ from pyam import concat
 from silicone.database_crunchers import DatabaseCruncherRMSClosest
 from silicone.database_crunchers.rms_closest import _select_closest
 
+_msa = ["model_a", "scen_a"]
+
 
 class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
     tclass = DatabaseCruncherRMSClosest
+    tdb = pd.DataFrame(
+        [
+            _msa + ["World", "Emissions|HFC|C5F12", "kt C5F12/yr", np.nan, 3.14],
+            _msa + ["World", "Emissions|HFC|C2F6", "kt C2F6/yr", 1.2, 1.5],
+        ],
+        columns=["model", "scenario", "region", "variable", "unit", 2010, 2015],
+    )
+
     tdownscale_df = pd.DataFrame(
         [
             ["model_b", "scen_b", "World", "Emissions|HFC|C2F6", "kt C2F6/yr", 1, 2, 3],
