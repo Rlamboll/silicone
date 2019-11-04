@@ -167,6 +167,31 @@ class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
 
         assert all(crunched["value"].values == expected)
 
+    def test_extreme_values_relationship(self):
+        # Our cruncher has a closest-point extrapolation algorithm and therefore
+        # should return the same values when filling for data outside tht limits of
+        # its cruncher
+
+        # Calculate the values using the cruncher for a fairly detailed dataset
+        large_db = IamDataFrame(self.large_db.copy())
+        tcruncher = self.tclass(large_db)
+        res = tcruncher.derive_relationship("Emissions|CH4", ["Emissions|CO2"])
+        assert callable(res)
+        crunched = res(large_db)
+
+        # Increase the maximum values
+        modify_extreme_db = large_db.filter(variable="Emissions|CO2").copy()
+        ind = modify_extreme_db["value"].idxmax
+        modify_extreme_db["value"].loc[ind] += 10
+        extreme_crunched = res(modify_extreme_db)
+        # Check results are the same
+        assert all(crunched["value"] == extreme_crunched["value"])
+        # Repeat with reducing the minimum value
+        ind = modify_extreme_db["value"].idxmin
+        modify_extreme_db["value"].loc[ind] -= 10
+        extreme_crunched = res(modify_extreme_db)
+        assert all(crunched["value"] == extreme_crunched["value"])
+
     def test_derive_relationship_same_gas(self, test_db, test_downscale_df):
         # Given only a single data series, we recreate the original pattern
         tcruncher = self.tclass(test_db)
@@ -288,8 +313,13 @@ class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
         test_downscale_df = self._adjust_time_style_to_match(test_downscale_df, test_db)
 
         error_msg = re.escape(
-            "Not all required timepoints are present in the IamDataFrame to "
-            "downscale, we require `{}`".format(test_db.timeseries().columns.tolist())
+            "Not all required timepoints are present in the database we "
+            "crunched, we crunched \n\t`{}`\nbut you passed in \n\t{}".format(
+                list(
+                    test_db.filter(year=2030, keep=False).timeseries().columns.tolist()
+                ),
+                test_db.timeseries().columns.tolist(),
+            )
         )
         with pytest.raises(ValueError, match=error_msg):
             filler(test_downscale_df)

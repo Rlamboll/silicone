@@ -11,16 +11,17 @@ def rolling_window_find_quantiles(
     """
     Perform quantile analysis in the y-direction for x-weighted data.
 
-    Divides the x-axis into nboxes of equal length and weights data by how close they
+    Divides the x-axis into nwindows of equal length and weights data by how close they
     are to the center of these boxes. Then returns the quantiles of this weighted data.
-    Quantiles are defined so that the value returned are always equal to a y-value in
+    Quantiles are defined so that the values returned are always equal to a y-value in
     the data - there is no interpolation. Extremal points are given their full
     weighting, meaning this will not agree with the np.quantiles under uniform weighting
     (which effectively gives 0 weight to min and max values)
 
     The weighting of a point at :math:`x` for a window centered at :math:`x_0` is:
-    .. math:
-        w = \\frac{1}{1+((x-x_0)/(box_length*decay_length_factor))^2}.
+
+    .. math::
+        w = \\frac{1}{1 + \\left (\\frac{x - x_0} {\\text{box_length} \\times \\text{decay_length_factor}} \\right )^2}
 
     Parameters
     ----------
@@ -39,7 +40,7 @@ def rolling_window_find_quantiles(
     decay_length_factor : float
         gives the distance over which the weighting of the values falls to 1/4,
         relative to half the distance between boxes. Defaults to 1. Formula is
-        w = 1/(1+(distance/(box_length*decay_length_factor))^2).
+        :math:`w = \\left ( 1 + \\left( \\frac{\\text{distance}}{\\text{box_length} \\times \\text{decay_length_factor}} \\right)^2 \\right)^{-1}`.
 
     Returns
     -------

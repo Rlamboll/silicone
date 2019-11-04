@@ -1,8 +1,6 @@
 """
 Module for the database cruncher which uses the 'rolling windows' technique.
 """
-import warnings
-
 import numpy as np
 import pandas as pd
 import scipy.interpolate
@@ -167,14 +165,16 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
             ys = ys[sort_order]
             xs = xs[sort_order]
             if max(xs) == min(xs):
-                # We must prevent singularity behaviour if all the points are at the same x value.
+                # We must prevent singularity behaviour if all the points are at the
+                # same x value.
                 cumsum_weights = np.array([(1 + x) / len(ys) for x in range(len(ys))])
 
-                derived_relationships[
-                    db_time
-                ] = lambda unused_variable, ys=ys, cumsum_weights=cumsum_weights, quantile=quantile: min(
-                    ys[cumsum_weights >= quantile]
-                )
+                def same_x_val_workaround(
+                    _, ys=ys, cumsum_weights=cumsum_weights, quantile=quantile
+                ):
+                    return min(ys[cumsum_weights >= quantile])
+
+                derived_relationships[db_time] = same_x_val_workaround
             else:
                 # We want to include the max x point, but not any point above it.
                 # The 0.99 factor prevents rounding error inclusion.
@@ -202,9 +202,13 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
                     db_time_table.columns.values.squeeze(),
                     db_time_table.loc[(db_time, quantile), :].values.squeeze(),
                     bounds_error=False,
+                    fill_value=(
+                        db_time_table.loc[(db_time, quantile)].iloc[0],
+                        db_time_table.loc[(db_time, quantile)].iloc[-1],
+                    ),
                 )
 
-        def filler(in_iamdf, interpolate=False):
+        def filler(in_iamdf):
             """
             Filler function derived from :obj:`DatabaseCruncherQuantileRollingWindows`.
 
@@ -212,10 +216,6 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
             ----------
             in_iamdf : :obj:`pyam.IamDataFrame`
                 Input data to fill data in
-
-            interpolate : bool
-                If the db_times used to derive the quantiles are not in ``in_iamdf``,
-                should a value be interpolated in order to do the infilling?
 
             Returns
             -------
@@ -225,8 +225,7 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
             Raises
             ------
             ValueError
-                The key db_times for filling are not in ``in_iamdf`` and ``interpolate is
-                False``.
+                The key db_times for filling are not in ``in_iamdf``.
             """
             if db_time_col != in_iamdf.time_col:
                 raise ValueError(
@@ -250,9 +249,10 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
 
             if not have_all_timepoints:
                 raise ValueError(
-                    "Not all required timepoints are present in the IamDataFrame "
-                    "to downscale, we require `{}`".format(
-                        in_iamdf.timeseries().columns.tolist()
+                    "Not all required timepoints are present in the database we "
+                    "crunched, we crunched \n\t`{}`\nbut you passed in \n\t{}".format(
+                        list(derived_relationships.keys()),
+                        in_iamdf.timeseries().columns.tolist(),
                     )
                 )
 
