@@ -5,10 +5,11 @@ import warnings
 
 import pyam
 
+from ..utils import _get_unit_of_variable
 from .base import _DatabaseCruncher
 
 
-class DatabaseCruncherRMSClosest(_DatabaseCruncher):
+class RMSClosest(_DatabaseCruncher):
     """
     Database cruncher which uses the 'closest RMS' technkque.
 
@@ -20,11 +21,11 @@ class DatabaseCruncherRMSClosest(_DatabaseCruncher):
     difference.
 
     .. math::
-        RMS = \\left ( \\frac{1}{n} \\sum_{t=0}^n (E_l(t) - E_l^{d}(t))^2 \\right )^{1/2}
+        RMS = \\left ( \\frac{1}{n} \\sum_{t=0}^n (E_l(t) - e_l(t))^2 \\right )^{1/2}
 
     where :math:`n` is the total number of timesteps in the lead gas' timeseries,
-    :math:`E_l(t)` is the lead gas emissions timeseries and :math:`E_l^d(t)` is a lead
-    gas emissions timeseries in the database.
+    :math:`E_l(t)` is the lead gas emissions timeseries and :math:`e_l(t)` is a lead
+    gas emissions timeseries in the infiller database.
     """
 
     def derive_relationship(self, variable_follower, variable_leaders):
@@ -61,17 +62,18 @@ class DatabaseCruncherRMSClosest(_DatabaseCruncher):
         """
         self._check_iamdf_lead(variable_leaders)
         iamdf_follower = self._get_iamdf_section(variable_follower)
-        iamdf_lead = self._db.filter(variable=variable_leaders)
-
-        leader_unit = iamdf_lead["unit"].unique()
-        assert len(leader_unit) == 1  # TODO: use functionality in #13
-        leader_unit = leader_unit[0]
-
         data_follower_time_col = iamdf_follower.time_col
+        iamdf_lead = self._db.filter(variable=variable_leaders)
+        iamdf_lead, iamdf_follower = _filter_for_overlap(
+            iamdf_lead, iamdf_follower, ["scenario", "model", data_follower_time_col]
+        )
+
+        leader_unit = _get_unit_of_variable(iamdf_lead, variable_leaders)
+        leader_unit = leader_unit[0]
 
         def filler(in_iamdf):
             """
-            Filler function derived from :obj:`DatabaseCruncherRMSClosest`.
+            Filler function derived from :obj:`RMSClosest`.
 
             Parameters
             ----------
@@ -151,7 +153,9 @@ class DatabaseCruncherRMSClosest(_DatabaseCruncher):
                     lead_var_timeseries.index.names.index("scenario")
                 ]
                 output_ts_list.append(tmp)
-
+                if in_iamdf.extra_cols:
+                    for col in in_iamdf.extra_cols:
+                        tmp[col] = label[lead_var_timeseries.index.names.index(col)]
             return pyam.concat(output_ts_list)
 
         return filler
@@ -159,7 +163,7 @@ class DatabaseCruncherRMSClosest(_DatabaseCruncher):
     def _check_iamdf_lead(self, variable_leaders):
         if len(variable_leaders) > 1:
             raise ValueError(
-                "For `DatabaseCruncherRMSClosest`, ``variable_leaders`` should only "
+                "For `RMSClosest`, ``variable_leaders`` should only "
                 "contain one variable"
             )
 
@@ -222,3 +226,30 @@ def _select_closest(to_search_df, target_series):
     labels, rmss = list(zip(*closeness))
     to_return = rmss.index(min(rmss))
     return dict(zip(to_search_df.index.names, labels[to_return]))
+
+
+def _filter_for_overlap(df1, df2, cols):
+    """
+    Returns rows in the two input dataframes which have the same columns
+    Parameters
+    ----------
+    df1 : :obj:`pd.DataFrame`
+        The first dataframe (order is irrelevant)
+    df2 : :obj:`pd.DataFrame`
+        The second dataframe (order is irrelevant)
+    cols: list[str]
+        List of columns that should be identical between the two dataframes.
+    Returns
+    -------
+    (:obj:`pd.DataFrame`, :obj:`pd.DataFrame`)
+        The two dataframes in the order they were put in, now filtered for some columns
+        being identical.
+    """
+    lead_data = df1.data.set_index(cols)
+    follow_data = df2.data.set_index(cols)
+    shared_indices = [ind for ind in lead_data.index if ind in follow_data.index]
+    if shared_indices:
+        lead_data = lead_data.loc[shared_indices]
+        follow_data = follow_data.loc[shared_indices]
+        return pyam.IamDataFrame(lead_data), pyam.IamDataFrame(follow_data)
+    raise ValueError("No model/scenario overlap between leader and follower data")

@@ -4,6 +4,7 @@ VENV_DIR ?= ./venv
 DATA_DIR ?= ./data
 DOCS_DIR=$(PWD)/docs
 SCRIPTS_DIR ?= ./scripts
+TESTS_DIR=$(PWD)/tests
 
 FILES_TO_FORMAT_PYTHON=setup.py scripts src tests docs/source/conf.py
 
@@ -12,7 +13,7 @@ SR15_EMISSIONS_DIR = $(DATA_DIR)/sr15_emissions
 SR15_EMISSIONS_FILE = $(SR15_EMISSIONS_DIR)/sr15_emissions.csv
 
 NOTEBOOKS_DIR=./notebooks
-NOTEBOOKS_SANITIZE_FILE=$(NOTEBOOKS_DIR)/tests_sanitize.cfg
+NOTEBOOKS_SANITIZE_FILE=$(TESTS_DIR)/notebook-tests.cfg
 
 define PRINT_HELP_PYSCRIPT
 import re, sys
@@ -58,6 +59,16 @@ black: $(VENV_DIR)  ## use black to autoformat code
 		echo Not trying any formatting, working directory is dirty... >&2; \
 	fi;
 
+.PHONY: checks
+checks: $(VENV_DIR)  ## run checks similar to CI
+	@echo "=== black ==="; $(VENV_DIR)/bin/black --check src tests setup.py docs/source/conf.py --exclude silicone/_version.py || echo "--- black failed ---" >&2; \
+		echo "\n\n=== isort ==="; $(VENV_DIR)/bin/isort --check-only --quiet --recursive src tests setup.py || echo "--- isort failed ---" >&2; \
+		echo "\n\n=== docs ==="; $(VENV_DIR)/bin/sphinx-build -M html docs/source docs/build -qW || echo "--- docs failed ---" >&2; \
+		echo "\n\n=== notebook tests ==="; $(VENV_DIR)/bin/pytest notebooks -r a --nbval-lax --sanitize-with tests/notebook-tests.cfg || echo "--- notebook tests failed ---" >&2; \
+		echo "\n\n=== tests ==="; $(VENV_DIR)/bin/pytest tests -r a --cov=silicone --cov-report='' \
+			&& $(VENV_DIR)/bin/coverage report --fail-under=95 || echo "--- tests failed ---" >&2; \
+		echo
+
 .PHONY: test-all
 test-all:  ## run the testsuite and test the notebooks
 	make test
@@ -69,11 +80,15 @@ test: $(VENV_DIR) ## run the full testsuite
 
 .PHONY: test-notebooks
 test-notebooks: $(VENV_DIR)  ## test the notebooks
-	$(VENV_DIR)/bin/pytest -r a --nbval $(NOTEBOOKS_DIR) --sanitize $(NOTEBOOKS_SANITIZE_FILE)
+	$(VENV_DIR)/bin/pytest -r a --nbval-lax $(NOTEBOOKS_DIR) --sanitize $(NOTEBOOKS_SANITIZE_FILE)
+
+.PHONY: format-notebooks
+format-notebooks: $(VENV_DIR)  ## format the notebooks
+	$(VENV_DIR)/bin/black-nb $(NOTEBOOKS_DIR)
 
 .PHONY: docs
-docs:  ## make docs
-	make $(DOCS_DIR)/build/html/index.html
+docs: $(VENV_DIR)  ## make docs
+	$(VENV_DIR)/bin/sphinx-build -M html docs/source docs/build
 
 $(DOCS_DIR)/build/html/index.html: $(DOCS_DIR)/source/*.py $(DOCS_DIR)/source/_templates/*.html $(DOCS_DIR)/source/*.rst src/silicone/**.py README.rst CHANGELOG.rst $(VENV_DIR)
 	cd $(DOCS_DIR); make html

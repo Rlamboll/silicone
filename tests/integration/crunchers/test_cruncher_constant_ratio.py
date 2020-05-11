@@ -6,14 +6,14 @@ import pandas as pd
 import pytest
 from pyam import IamDataFrame
 
-from silicone.database_crunchers import DatabaseCruncherConstantRatio
+from silicone.database_crunchers import ConstantRatio
 
 _msa = ["model_a", "scen_a"]
 _msb = ["model_a", "scen_b"]
 
 
 class TestDatabaseCruncherTimeDepRatio:
-    tclass = DatabaseCruncherConstantRatio
+    tclass = ConstantRatio
     tdb = pd.DataFrame(
         [
             _msa + ["World", "Emissions|HFC|C5F12", "kt C5F12/yr", 2, 3],
@@ -84,7 +84,7 @@ class TestDatabaseCruncherTimeDepRatio:
     def test_derive_relationship_error_multiple_lead_vars(self):
         tcruncher = self.tclass()
         error_msg = re.escape(
-            "For `DatabaseCruncherConstantRatio`, ``variable_leaders`` should only "
+            "For `ConstantRatio`, ``variable_leaders`` should only "
             "contain one variable"
         )
         with pytest.raises(ValueError, match=error_msg):
@@ -92,18 +92,25 @@ class TestDatabaseCruncherTimeDepRatio:
                 "Emissions|HFC|C5F12", ["a", "b"], ratio=0.5, units="Some_unit"
             )
 
-    def test_relationship_usage(self, unequal_df, test_downscale_df):
-        equal_df = unequal_df.filter(model="model_a")
+    @pytest.mark.parametrize("add_col", [None, "extra_col"])
+    def test_relationship_usage(self, test_downscale_df, add_col):
         units = "new units"
         tcruncher = self.tclass()
         test_downscale_df = test_downscale_df.filter(year=[2010, 2015])
-        filler = tcruncher.derive_relationship(
-            "Emissions|HFC|C5F12", ["Emissions|HFC|C2F6"], ratio=2, units=units
-        )
+        if add_col:
+            # what should happen if there's more than one value in the `add_col`?
+            add_col_val = "blah"
+            test_downscale_df[add_col] = add_col_val
+            test_downscale_df = IamDataFrame(test_downscale_df.data)
+            assert test_downscale_df.extra_cols[0] == add_col
+
+        lead = ["Emissions|HFC|C2F6"]
+        follow = "Emissions|HFC|C5F12"
+        filler = tcruncher.derive_relationship(follow, lead, ratio=2, units=units)
         res = filler(test_downscale_df)
 
-        exp = test_downscale_df.filter(variable="Emissions|HFC|C2F6")
-        exp.data["variable"] = "Emissions|HFC|C5F12"
+        exp = test_downscale_df.filter(variable=lead)
+        exp.data["variable"] = follow
         exp.data["value"] = exp.data["value"] * 2
         exp.data["unit"] = units
 
@@ -116,6 +123,13 @@ class TestDatabaseCruncherTimeDepRatio:
             res.timeseries().columns.values.squeeze(),
             test_downscale_df.timeseries().columns.values.squeeze(),
         )
+
+        # Test we can append the results correctly
+        append_df = test_downscale_df.append(res)
+        assert append_df.filter(variable=follow).equals(res)
+
+        if add_col:
+            assert all(append_df.filter(variable=lead)[add_col] == add_col_val)
 
     def test_relationship_usage_set_0(self, test_downscale_df):
         tcruncher = self.tclass()

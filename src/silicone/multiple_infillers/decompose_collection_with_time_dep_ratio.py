@@ -4,7 +4,8 @@ aggregate variable and breaking this mix into its constituents.
 """
 
 import pyam
-from silicone.database_crunchers import DatabaseCruncherTimeDepRatio
+
+from silicone.database_crunchers import TimeDepRatio
 from silicone.utils import convert_units_to_MtCO2_equiv
 
 
@@ -73,6 +74,20 @@ class DecomposeCollectionTimeDepRatio:
         use["variable"] = aggregate_name
         return pyam.IamDataFrame(use)
 
+    def _set_of_units_without_equiv(self, df):
+        """
+        Parameters
+        ----------
+        df : obj:`pyam.IamDataFrame`
+            The dataframe whose units we want
+
+        Returns
+        -------
+        Set(str)
+            The set of units from the dataframe with "-equiv" removed
+        """
+        return set(df.data["unit"].map(lambda x: x.replace("-equiv", "")))
+
     def infill_components(
         self, aggregate, components, to_infill_df, use_ar4_data=False
     ):
@@ -134,20 +149,31 @@ class DecomposeCollectionTimeDepRatio:
                 self._db.filter(
                     model=model, scenario=scenario, keep=False, inplace=True
                 )
-        convert_base = convert_units_to_MtCO2_equiv(self._db, use_AR4_data=use_ar4_data)
-        db_to_generate = convert_units_to_MtCO2_equiv(
-            convert_base, use_AR4_data=use_ar4_data
-        )
+        if len(self._set_of_units_without_equiv(self._db)) > 1:
+            db_to_generate = convert_units_to_MtCO2_equiv(
+                self._db, use_ar4_data=use_ar4_data
+            )
+        else:
+            db_to_generate = self._db
         consistent_composite = self._construct_consistent_values(
             aggregate, components, db_to_generate
         )
-        convert_base.append(consistent_composite, inplace=True)
-        cruncher = DatabaseCruncherTimeDepRatio(convert_base)
-        df_to_append = []
+        self._db.append(consistent_composite, inplace=True)
+        cruncher = TimeDepRatio(self._db)
+        if self._set_of_units_without_equiv(
+            to_infill_df
+        ) != self._set_of_units_without_equiv(consistent_composite):
+            raise ValueError(
+                "The units of the aggregate variable are inconsistent between the "
+                "input and constructed data. We input {} and constructed {}.".format(
+                    self._set_of_units_without_equiv(to_infill_df),
+                    self._set_of_units_without_equiv(consistent_composite),
+                )
+            )
         for leader in components:
             to_add = cruncher.derive_relationship(leader, [aggregate])(to_infill_df)
-            if df_to_append:
-                df_to_append.append(to_add)
-            else:
+            try:
+                df_to_append.append(to_add, inplace=True)
+            except NameError:
                 df_to_append = to_add
         return df_to_append

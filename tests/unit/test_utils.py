@@ -1,19 +1,26 @@
+import os
 import re
-import os.path
 
-import pyam
 import numpy as np
 import pandas as pd
+import pyam
 import pytest
+from openscm_units.unit_registry import ScmUnitRegistry
+from pint.errors import UndefinedUnitError
+from requests.exceptions import ConnectionError
 
 from silicone.utils import (
+    _construct_consistent_values,
     _get_unit_of_variable,
-    find_matching_scenarios,
     _make_interpolator,
-    return_cases_which_consistently_split,
     convert_units_to_MtCO2_equiv,
-    get_sr15_scenarios,
+    download_or_load_sr15,
+    find_matching_scenarios,
+    return_cases_which_consistently_split,
 )
+
+_ur = ScmUnitRegistry()
+_ur.add_standards()
 
 _mc = "model_c"
 _sa = "scen_a"
@@ -33,6 +40,15 @@ simple_df = pd.DataFrame(
     columns=_msrvu + [2010, 2030, 2050],
 )
 simple_df = pyam.IamDataFrame(simple_df)
+_msa = ["model_a", "scen_a"]
+tdb = pd.DataFrame(
+    [
+        _msa + ["World", "Emissions|HFC|C5F12", "kt C5F12/yr", 2, 3],
+        _msa + ["World", "Emissions|HFC|C2F6", "kt C2F6/yr", 0.5, 1.5],
+    ],
+    columns=["model", "scenario", "region", "variable", "unit", 2010, 2015],
+)
+test_db = pyam.IamDataFrame(tdb)
 
 df_low = simple_df.copy()
 df_low.data["scenario"].loc[df_low.data["scenario"] == "scen_a"] = "right_scenario"
@@ -354,8 +370,8 @@ def test_convert_units_to_mtco2_equiv_fails_with_month_units(check_aggregate_df)
     )
     limited_check_agg.data["unit"].iloc[0] = "Mt CH4/mo"
     limited_check_agg = pyam.IamDataFrame(limited_check_agg.data)
-    err_msg = "The units are unexpectedly not per year"
-    with pytest.raises(AssertionError, match=err_msg):
+    err_msg = "'mo' is not defined in the unit registry"
+    with pytest.raises(UndefinedUnitError, match=err_msg):
         convert_units_to_MtCO2_equiv(limited_check_agg)
 
 
@@ -363,21 +379,26 @@ def test_convert_units_to_mtco2_equiv_fails_with_oom_units(check_aggregate_df):
     limited_check_agg = check_aggregate_df.filter(
         variable="Primary Energy*", keep=False
     )
-    limited_check_agg.data["unit"].iloc[0] = "Tt CO2/yr"
+    limited_check_agg.data["unit"].iloc[0] = "Tt CO2"
     limited_check_agg = pyam.IamDataFrame(limited_check_agg.data)
-    err_msg = "Unclear how to parse the units for {}.".format("Tt CO2")
+    err_msg = re.escape(
+        "Cannot convert from Tt CO2 (cleaned is: Tt CO2) to Mt CO2-equiv/yr (cleaned is: Mt CO2/yr)"
+    )
     with pytest.raises(ValueError, match=err_msg):
         convert_units_to_MtCO2_equiv(limited_check_agg)
 
 
 def test_convert_units_to_mtco2_equiv_fails_with_bad_units(check_aggregate_df):
-    with pytest.raises(AssertionError):
+    err_msg = "'y' is not defined in the unit registry"
+    with pytest.raises(UndefinedUnitError, match=err_msg):
         convert_units_to_MtCO2_equiv(check_aggregate_df)
+
     limited_check_agg = check_aggregate_df.filter(
         variable="Primary Energy*", keep=False
     )
     limited_check_agg.data["unit"].iloc[0] = "bad unit"
-    with pytest.raises(AssertionError):
+    err_msg = "'bad' is not defined in the unit registry"
+    with pytest.raises(UndefinedUnitError, match=err_msg):
         convert_units_to_MtCO2_equiv(limited_check_agg)
 
 
@@ -407,22 +428,56 @@ def test_convert_units_to_MtCO2_equiv_works(check_aggregate_df, ARoption, expect
     )
 
 
+@pytest.mark.parametrize(
+    "unit_start", ("kt CF4-equiv/yr", "kt CF4 equiv/yr", "kt CF4equiv/yr",)
+)
+def test_convert_units_to_MtCO2_equiv_equiv_start(check_aggregate_df, unit_start):
+    limited_check_agg = check_aggregate_df.filter(
+        variable="Primary Energy*", keep=False
+    )
+    limited_check_agg.data["unit"] = unit_start
+    converted_data = convert_units_to_MtCO2_equiv(limited_check_agg)
+
+    assert (converted_data.data["unit"] == "Mt CO2-equiv/yr").all()
+
+    with _ur.context("AR5GWP100"):
+        exp_conv_factor = _ur("kt CF4/yr").to("Mt CO2/yr").magnitude
+    assert converted_data.data["value"].equals(
+        limited_check_agg.data["value"] * exp_conv_factor
+    )
+
+
 def test_convert_units_to_MtCO2_equiv_doesnt_change(check_aggregate_df):
     # Check that it does nothing when nothing needs doing
     limited_check_agg = check_aggregate_df.filter(
         variable="Primary Energy*", keep=False
     )
-    limited_check_agg.data["unit"] = "Mt CO2 equiv/yr"
+    limited_check_agg.data["unit"] = "Mt CO2-equiv/yr"
     converted_data = convert_units_to_MtCO2_equiv(limited_check_agg)
+    assert (converted_data.data["unit"] == "Mt CO2-equiv/yr").all()
+    assert converted_data.data.equals(limited_check_agg.data)
+
+
+def test_convert_units_to_MtCO2_doesnt_change(check_aggregate_df):
+    # Check that it does nothing when nothing needs doing
+    limited_check_agg = check_aggregate_df.filter(
+        variable="Primary Energy*", keep=False
+    )
+    limited_check_agg.data["unit"] = "Mt CO2/yr"
+    converted_data = convert_units_to_MtCO2_equiv(limited_check_agg)
+
+    assert (converted_data.data["unit"] == "Mt CO2/yr").all()
     assert converted_data.data.equals(limited_check_agg.data)
 
 
 def test_get_files_and_use_them():
     try:
+        # Remove any pre-exising files to check we make new ones
         SR15_SCENARIOS = "./sr15_scenarios.csv"
+        if os.path.isfile(SR15_SCENARIOS):
+            os.remove(SR15_SCENARIOS)
         valid_model_ids = ["GCAM*"]
-        get_sr15_scenarios(SR15_SCENARIOS, valid_model_ids)
-        sr15_data = pyam.IamDataFrame(SR15_SCENARIOS)
+        sr15_data = download_or_load_sr15(SR15_SCENARIOS, valid_model_ids)
         min_expected_var = [
             "Emissions|N2O",
             "Emissions|CO2",
@@ -431,5 +486,93 @@ def test_get_files_and_use_them():
         ]
         variables_in_result = sr15_data.variables()
         assert all([y in variables_in_result.values for y in min_expected_var])
-    except ConnectionError:
-        pass
+        assert os.path.isfile(SR15_SCENARIOS)
+        # Now check that the function works correctly again
+        variables_in_result_2 = download_or_load_sr15(
+            SR15_SCENARIOS, valid_model_ids
+        ).variables()
+        assert all(variables_in_result_2 == variables_in_result)
+        blank_variables = download_or_load_sr15(
+            SR15_SCENARIOS, ["bad_model"]
+        ).variables()
+        assert all([y not in blank_variables.values for y in min_expected_var])
+        os.remove(SR15_SCENARIOS)
+    except ConnectionError as e:
+        pytest.skip("Could not connect to the IIASA database: {}".format(e))
+
+
+def test__construct_consistent_values():
+    test_db_co2 = convert_units_to_MtCO2_equiv(test_db)
+    aggregate_name = "agg"
+    assert aggregate_name not in test_db_co2.variables().values
+    component_ratio = ["Emissions|HFC|C2F6", "Emissions|HFC|C5F12"]
+    consistent_vals = _construct_consistent_values(
+        aggregate_name, component_ratio, test_db_co2
+    )
+    assert aggregate_name in consistent_vals["variable"].values
+    consistent_vals = consistent_vals.timeseries()
+    timeseries_data = test_db_co2.timeseries()
+    assert all(
+        [
+            np.allclose(
+                consistent_vals.iloc[0].iloc[ind],
+                timeseries_data.iloc[0].iloc[ind] + timeseries_data.iloc[1].iloc[ind],
+            )
+            for ind in range(len(timeseries_data.iloc[0]))
+        ]
+    )
+
+
+def test__construct_consistent_values_with_equiv():
+    test_db_co2 = convert_units_to_MtCO2_equiv(test_db)
+    test_db_co2.data["unit"].loc[0:1] = "Mt CO2/yr"
+    aggregate_name = "agg"
+    assert aggregate_name not in test_db_co2.variables().values
+    component_ratio = ["Emissions|HFC|C2F6", "Emissions|HFC|C5F12"]
+    consistent_vals = _construct_consistent_values(
+        aggregate_name, component_ratio, test_db_co2
+    )
+    assert aggregate_name in consistent_vals["variable"].values
+    consistent_vals = consistent_vals.timeseries()
+    timeseries_data = test_db_co2.timeseries()
+    assert all(
+        [
+            np.allclose(
+                consistent_vals.iloc[0].iloc[ind],
+                timeseries_data.iloc[0].iloc[ind] + timeseries_data.iloc[1].iloc[ind],
+            )
+            for ind in range(len(timeseries_data.iloc[0]))
+        ]
+    )
+    # We also require that the output units are '-equiv'
+    assert all(
+        y == "Mt CO2-equiv/yr" for y in consistent_vals.index.get_level_values("unit")
+    )
+
+
+def test_construct_consistent_error_multiple_units():
+    # test that construction fails if there's no data about the follower gas in the
+    # database
+    aggregate_name = "Emissions|HFC|C5F12"
+    components = ["Emissions|HFC|C2F6"]
+    test_db_units = test_db.copy()
+    test_db_units.data["variable"] = components[0]
+    error_msg = re.escape(
+        "Too many units found to make a consistent {}".format(aggregate_name)
+    )
+    with pytest.raises(ValueError, match=error_msg):
+        _construct_consistent_values(aggregate_name, components, test_db_units)
+
+
+def test_construct_consistent_error_no_data():
+    # test that construction fails if there's no data about the follower gas in the
+    # database
+    aggregate_name = "Emissions|HFC|C5F12"
+    components = ["Emissions|HFC|C2F6"]
+    test_db_ag = test_db.filter(variable="not there")  # This generates an empty df
+    error_msg = re.escape(
+        "Attempting to construct a consistent {} but none of the components "
+        "present".format(aggregate_name)
+    )
+    with pytest.raises(ValueError, match=error_msg):
+        _construct_consistent_values(aggregate_name, components, test_db_ag)

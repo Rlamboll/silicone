@@ -4,10 +4,11 @@ import numpy as np
 import pandas as pd
 import pyam
 import pytest
+
 from silicone.multiple_infillers.decompose_collection_with_time_dep_ratio import (
     DecomposeCollectionTimeDepRatio,
 )
-from silicone.utils import convert_units_to_MtCO2_equiv, _adjust_time_style_to_match
+from silicone.utils import _adjust_time_style_to_match, convert_units_to_MtCO2_equiv
 
 _msa = ["model_a", "scen_a"]
 _msb = ["model_a", "scen_b"]
@@ -15,6 +16,7 @@ _msb = ["model_a", "scen_b"]
 
 class TestGasDecomposeTimeDepRatio:
     tclass = DecomposeCollectionTimeDepRatio
+    # tdb will generate test_db
     tdb = pd.DataFrame(
         [
             _msa + ["World", "Emissions|HFC|C5F12", "kt C5F12/yr", 2, 3],
@@ -80,58 +82,6 @@ class TestGasDecomposeTimeDepRatio:
         ],
     )
 
-    def test__construct_consistent_values(self, test_db):
-        test_db_co2 = convert_units_to_MtCO2_equiv(test_db)
-        tcruncher = self.tclass(test_db_co2)
-        aggregate_name = "agg"
-        assert aggregate_name not in tcruncher._db.variables().values
-        component_ratio = ["Emissions|HFC|C2F6", "Emissions|HFC|C5F12"]
-        consistent_vals = tcruncher._construct_consistent_values(
-            aggregate_name, component_ratio, test_db_co2
-        )
-        assert aggregate_name in consistent_vals["variable"].values
-        consistent_vals = consistent_vals.timeseries()
-        timeseries_data = tcruncher._db.timeseries()
-        assert all(
-            [
-                np.allclose(
-                    consistent_vals.iloc[0].iloc[ind],
-                    timeseries_data.iloc[0].iloc[ind]
-                    + timeseries_data.iloc[1].iloc[ind],
-                )
-                for ind in range(len(timeseries_data.iloc[0]))
-            ]
-        )
-
-    def test__construct_consistent_values_with_equiv(self, test_db):
-        test_db_co2 = convert_units_to_MtCO2_equiv(test_db)
-        test_db_co2.data["unit"].loc[0:1] = "Mt CO2/yr"
-        tcruncher = self.tclass(test_db_co2)
-        aggregate_name = "agg"
-        assert aggregate_name not in tcruncher._db.variables().values
-        component_ratio = ["Emissions|HFC|C2F6", "Emissions|HFC|C5F12"]
-        consistent_vals = tcruncher._construct_consistent_values(
-            aggregate_name, component_ratio, test_db_co2
-        )
-        assert aggregate_name in consistent_vals["variable"].values
-        consistent_vals = consistent_vals.timeseries()
-        timeseries_data = tcruncher._db.timeseries()
-        assert all(
-            [
-                np.allclose(
-                    consistent_vals.iloc[0].iloc[ind],
-                    timeseries_data.iloc[0].iloc[ind]
-                    + timeseries_data.iloc[1].iloc[ind],
-                )
-                for ind in range(len(timeseries_data.iloc[0]))
-            ]
-        )
-        # We also require that the output units are '-equiv'
-        assert all(
-            y == "Mt CO2-equiv/yr"
-            for y in consistent_vals.index.get_level_values("unit")
-        )
-
     def test_infill_components_error_no_lead_vars(self, test_db):
         tcruncher = self.tclass(test_db)
         error_msg = re.escape(
@@ -171,20 +121,9 @@ class TestGasDecomposeTimeDepRatio:
         with pytest.raises(AssertionError, match=error_msg):
             tcruncher.infill_components(variable_follower, variable_leaders, test_db)
 
-    def test_construct_consistent_error_multiple_units(self, test_db):
-        # test that crunching fails if there's no data about the follower gas in the
-        # database
-        aggregate_name = "Emissions|HFC|C5F12"
-        components = ["Emissions|HFC|C2F6"]
-        test_db.data["variable"] = components[0]
-        tcruncher = self.tclass(test_db)
-        error_msg = re.escape(
-            "Too many units found to make a consistent {}".format(aggregate_name)
-        )
-        with pytest.raises(ValueError, match=error_msg):
-            tcruncher._construct_consistent_values(aggregate_name, components, test_db)
-
     def test_relationship_usage_not_enough_time(self, test_db, test_downscale_df):
+        # Ensure that the process fails if not all times have data
+        test_db.data["unit"] = "kt C2F6-equiv/yr"
         tcruncher = self.tclass(test_db)
         test_downscale_df = _adjust_time_style_to_match(test_downscale_df, test_db)
         error_msg = re.escape(
@@ -197,7 +136,11 @@ class TestGasDecomposeTimeDepRatio:
             )
 
     def test_relationship_usage_works(self, test_db, test_downscale_df):
+        # Test that we get the correct results when everything is in order.
+        # First fix the units problem
+        test_db.data["unit"] = "kt C2F6-equiv/yr"
         tcruncher = self.tclass(test_db)
+        # Fix times to agree
         test_downscale_df = _adjust_time_style_to_match(test_downscale_df, test_db)
         if test_db.time_col == "year":
             test_downscale_df.filter(
@@ -206,17 +149,65 @@ class TestGasDecomposeTimeDepRatio:
         else:
             test_downscale_df.filter(time=test_db.data[test_db.time_col], inplace=True)
         components = ["Emissions|HFC|C5F12"]
+        # Perform the calculation
         filled = tcruncher.infill_components(
             "Emissions|HFC|C2F6", components, test_downscale_df
         )
-        # The value returned should include only one entry with
+        # The values returned should include only 1 entry per input entry, since there
+        # is a single input component
         assert len(filled.data) == 4
         assert all(y == components[0] for y in filled.variables())
         assert np.allclose(filled.data["value"], test_downscale_df.data["value"])
 
+    def test_relationship_usage_works_multiple(self, test_db, test_downscale_df):
+        # Test that the decomposer function works for slightly more complicated data
+        # (two components).
+        # Get matching times
+        test_downscale_df = _adjust_time_style_to_match(test_downscale_df, test_db)
+        if test_db.time_col == "year":
+            test_downscale_df.filter(
+                year=test_db.data[test_db.time_col].values, inplace=True
+            )
+        else:
+            test_downscale_df.filter(time=test_db.data[test_db.time_col], inplace=True)
+        # Make the variables work for our case
+        components = ["Emissions|HFC|C5F12", "Emissions|HFC|C2F6"]
+        aggregate = "Emissions|HFC"
+        test_downscale_df.data["variable"] = aggregate
+        tcruncher = self.tclass(test_db)
+        with pytest.raises(ValueError):
+            filled = tcruncher.infill_components(
+                aggregate, components, test_downscale_df
+            )
+        test_downscale_df = convert_units_to_MtCO2_equiv(test_downscale_df)
+        filled = tcruncher.infill_components(aggregate, components, test_downscale_df)
+        # The value returned should be a dataframe with 2 entries per original entry (4)
+        assert len(filled.data) == 8
+        assert all(y in filled.variables().values for y in components)
+        # We also expect the amount of the variables to be conserved
+        if test_db.time_col == "year":
+            assert np.allclose(
+                test_downscale_df.data.groupby("year").sum()["value"].values,
+                convert_units_to_MtCO2_equiv(filled)
+                .data.groupby("year")
+                .sum()["value"]
+                .values,
+            )
+        else:
+            assert np.allclose(
+                test_downscale_df.data.groupby("time").sum()["value"].values,
+                convert_units_to_MtCO2_equiv(filled)
+                .data.groupby("time")
+                .sum()["value"]
+                .values,
+            )
+
     def test_relationship_rejects_inconsistent_columns(self, larger_df, test_db):
+        # There are optional extra columns on the DataFrame objects. This test ensures
+        # that an error is thrown if we add together different sorts of DataFrame.
         aggregate = "Emissions|KyotoTotal"
         test_db.data["variable"] = aggregate
+        # larger_df has an extra column, "meta"
         larger_df = _adjust_time_style_to_match(larger_df, test_db)
         tcruncher = self.tclass(larger_df)
         if test_db.time_col == "year":
@@ -225,14 +216,17 @@ class TestGasDecomposeTimeDepRatio:
             larger_df.filter(time=test_db.data[test_db.time_col], inplace=True)
         components = ["Emissions|CH4", "Emissions|CO2"]
         err_msg = re.escape(
-            "The database and to_infill_db fed into this have "
-            "inconsistent columns, which will prevent adding the data together properly."
+            "The database and to_infill_db fed into this have inconsistent "
+            "columns, which will prevent adding the data together properly."
         )
         with pytest.raises(AssertionError, match=err_msg):
             tcruncher.infill_components(aggregate, components, test_db)
 
     def test_relationship_ignores_incomplete_data(self, larger_df, test_db):
+        # If we make the data inconsistent, we still get a consistent (if arbitrary)
+        # output.
         aggregate = "Emissions|KyotoTotal"
+        # This makes the data contain duplicates:
         test_db.data["variable"] = aggregate
         test_db.data["unit"] = "Mt CO2/yr"
         # We remove the extra column from the larger_df as it's not found in test_df
@@ -245,4 +239,9 @@ class TestGasDecomposeTimeDepRatio:
         else:
             larger_df.filter(time=test_db.data[test_db.time_col], inplace=True)
         components = ["Emissions|CH4", "Emissions|CO2"]
-        tcruncher.infill_components(aggregate, components, test_db)
+        returned = tcruncher.infill_components(aggregate, components, test_db)
+        assert len(returned.data) == len(test_db.data)
+        # Make the data consistent:
+        test_db.data = test_db.data.iloc[0:2]
+        returned = tcruncher.infill_components(aggregate, components, test_db)
+        assert len(returned.data) == 2 * len(test_db.data)

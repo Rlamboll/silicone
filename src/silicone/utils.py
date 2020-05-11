@@ -1,13 +1,19 @@
+import datetime as dt
 import logging
+import os.path
 
 import numpy as np
 import pandas as pd
-import scipy.interpolate
-import os.path
 import pyam
-import datetime as dt
+import scipy.interpolate
+from openscm_units.unit_registry import ScmUnitRegistry
+from pint.errors import DimensionalityError
 
 logger = logging.getLogger(__name__)
+
+# initialise our own registry to avoid conflicts
+_ur = ScmUnitRegistry()
+_ur.add_standards()
 
 """
 Utils contains a number of helpful functions that don't belong elsewhere.
@@ -57,12 +63,12 @@ def find_matching_scenarios(
 
     classify_scenarios : list[str]
         The names of scenarios or groups of scenarios that are possible matches.
-        This may have *s to represent wild cards, hence multiple scenarios will have
+        This may have "\*"s to represent wild cards, hence multiple scenarios will have
         all their data combined to make the interpolator.
 
     classify_models : list[str]
         The names of models or groups of models that are possible matches.
-        This may have *s to represent wild cards, hence multiple models will have
+        This may have "\*"s to represent wild cards, hence multiple models will have
         all their data combined to make the interpolator.
 
     return_all_info : bool
@@ -227,7 +233,6 @@ def _make_wide_db(use_db):
     return use_db
 
 
-# TODO: put this in pyam
 def _get_unit_of_variable(df, variable, multiple_units="raise"):
     """
     Get the unit of a variable in ``df``
@@ -238,7 +243,8 @@ def _get_unit_of_variable(df, variable, multiple_units="raise"):
         String to use to filter variables
 
     multiple_units : str
-        If ``"raise"``, check that the variable only has one unit and raise an ``AssertionError`` if it has more than one unit.
+        If ``"raise"``, check that the variable only has one unit and raise an
+        ``AssertionError`` if it has more than one unit.
 
     Returns
     -------
@@ -260,11 +266,12 @@ def _get_unit_of_variable(df, variable, multiple_units="raise"):
 
 
 def return_cases_which_consistently_split(
-    df, aggregate, components, how_close=None, use_AR4_data=False
+    df, aggregate, components, how_close=None, use_ar4_data=False
 ):
     """
     Returns model-scenario tuples which correctly split up the to_split into the various
-    components. Components may contain wildcard "*"s to match several variables.
+    components. Components may contain wildcard "\*"s to match several variables.
+
     Parameters
     ----------
     df: :obj:`pyam.IamDataFrame`
@@ -283,20 +290,20 @@ def return_cases_which_consistently_split(
         tolerance of 1% ('rtol': 1e-2). The syntax for this can be found in the numpy
         documentation.
 
-    use_AR4_data : bool
+    use_ar4_data : bool
         Determines whether the unit conversion takes place using GWP100 values from
         the UNFCCC AR5 (if false, default) or AR4 (if true).
 
     Returns
     -------
-     list[(str, str, str)]
+    list[(str, str, str)]
         List of consistent (Model name, scenario name, region name) tuples.
     """
     if not how_close:
         how_close = {"equal_nan": True, "rtol": 1e-02}
     valid_model_scenario = []
     df = convert_units_to_MtCO2_equiv(
-        df.filter(variable=[aggregate] + components), use_AR4_data
+        df.filter(variable=[aggregate] + components), use_ar4_data
     )
     combinations = df.data[["model", "scenario", "region"]].drop_duplicates()
     for ind in range(len(combinations)):
@@ -315,7 +322,7 @@ def return_cases_which_consistently_split(
                 np.isclose(
                     sum_all["value"].loc[time],
                     sum_to_split["value"].loc[time] * 2,
-                    **how_close
+                    **how_close,
                 )
                 for time in sum_to_split.index
             ]
@@ -324,17 +331,18 @@ def return_cases_which_consistently_split(
     return valid_model_scenario
 
 
-def convert_units_to_MtCO2_equiv(df, use_AR4_data=False):
+def convert_units_to_MtCO2_equiv(df, use_ar4_data=False):
     """
-    Converts the units of gases reported in kt into Mt CO2 equivalent, using GWP100
-    values from either (by default) AR5 or AR4 UNFCCC reports.
+    Converts the units of gases reported in kt into Mt CO2 equivalent per year
+
+    Uses GWP100 values from either (by default) AR5 or AR4 IPCC reports.
 
     Parameters
     ----------
     df : :obj:`pyam.IamDataFrame`
-        The input dataframe whose units need conversion.
+        The input dataframe whose units need to be converted.
 
-    use_AR4_data : bool
+    use_ar4_data : bool
         If true, use the AR4 GWP100 conversion figures, else use the AR5.
 
     Return
@@ -343,72 +351,87 @@ def convert_units_to_MtCO2_equiv(df, use_AR4_data=False):
         The input data with units converted.
     """
     # Check things need converting
-    if all(y[0:6] == "Mt CO2" for y in df.variables(True)["unit"]):
+    convert_to_str = "Mt CO2-equiv/yr"
+    convert_to_str_clean = "Mt CO2/yr"
+    if df["unit"].isin([convert_to_str, convert_to_str_clean]).all():
         return df
-    if use_AR4_data:
-        file = "../../Input/GWP100_unit_conversion_AR4.csv"
-    else:
-        file = "../../Input/GWP100_unit_conversion_AR5.csv"
-    conversion_factors = pd.read_csv(
-        os.path.join(os.path.dirname(__file__), file), sep=";", header=3
-    )
-    # This string is found at the start of all correct units:
-    convert_to_str = "Mt CO2"
+
+    context = "AR4GWP100" if use_ar4_data else "AR5GWP100"
+
     to_convert_df = df.copy()
     to_convert_var = to_convert_df.filter(
-        unit=convert_to_str + "*", keep=False
+        unit=[convert_to_str, convert_to_str_clean], keep=False
     ).variables(True)
     to_convert_units = to_convert_var["unit"]
-    not_found = [
-        y
-        for y in to_convert_units.map(
-            lambda x: x.split(" ")[-1][:-3].replace("-equiv", "")
-        ).values
-        if y not in conversion_factors["Gas"].values
-    ]
-    assert (
-        not not_found
-    ), "Not all units are found in the conversion table. We lack {}".format(not_found)
-    assert all(
-        y == "/yr" for y in to_convert_units.map(lambda x: x.split(" ")[-1][-3:]).values
-    ), "The units are unexpectedly not per year"
-    for ind in range(len(to_convert_units)):
-        unit = to_convert_units[ind]
-        gas_name = to_convert_units[ind].split(" ")[-1][:-3].replace("-equiv", "")
-        # We divide by 1000 if we convert Mt to kt
-        if unit[0] == "M":
-            order_of_magnitude = 1
-        elif unit[0] == "k":
-            order_of_magnitude = 1 / 1000
-        else:
-            raise ValueError("Unclear how to parse the units for {}.".format(unit))
-        conv_factor = (
-            order_of_magnitude
-            * conversion_factors[conversion_factors["Gas"] == gas_name]["GWP100"].iloc[
-                0
-            ]
-        )
+    to_convert_units_clean = {
+        unit: unit.replace("-equiv", "").replace("equiv", "")
+        for unit in to_convert_units
+    }
+
+    conversion_factors = {}
+    not_found = []
+    with _ur.context(context):
+        for unit in to_convert_units:
+            if unit in conversion_factors:
+                continue
+
+            clean_unit = to_convert_units_clean[unit]
+            try:
+                conversion_factors[unit] = (
+                    _ur(clean_unit).to(convert_to_str_clean).magnitude
+                )
+            except DimensionalityError:
+                raise ValueError(
+                    "Cannot convert from {} (cleaned is: {}) "
+                    "to {} (cleaned is: {})".format(
+                        unit, clean_unit, convert_to_str, convert_to_str_clean
+                    )
+                )
+
+    assert not not_found, "Not all units can be converted. We lack {}".format(not_found)
+
+    for unit in to_convert_units:
         to_convert_df.convert_unit(
-            {unit: [convert_to_str + "-equiv/yr", conv_factor]}, inplace=True
+            {unit: [convert_to_str, conversion_factors[unit]]}, inplace=True
         )
+
     return to_convert_df
+
+
+def download_or_load_sr15(filename, valid_model_ids="*"):
+    """
+    Load SR1.5 data, if it isn't there, download it
+
+    Parameters
+    ----------
+    filename : str
+        Filename in which to look for/save the data
+    valid_model_ids : str
+        Models to return from date
+
+    Returns
+    -------
+    :obj: `pyam.IamDataFrame`
+        The loaded data
+    """
+    if not os.path.isfile(filename):
+        get_sr15_scenarios(filename, valid_model_ids)
+    return pyam.IamDataFrame(filename).filter(model=valid_model_ids)
 
 
 def get_sr15_scenarios(output_file, valid_model_ids):
     """
-       Collects world-level data from the IIASA database for the named models and saves
-       them to a given location.
+    Collects world-level data from the IIASA database for the named models and saves them to a given location.
 
-        Parameters
-        ----------
-        output_file : str
-            File name and location for data to be saved
+    Parameters
+    ----------
+    output_file : str
+        File name and location for data to be saved
 
-        valid_model_ids : list[str]
-            Names of models that are to be fetched.
-
+    valid_model_ids : list[str]
+        Names of models that are to be fetched.
     """
-    conn = pyam.iiasa.Connection("iamc15")
+    conn = pyam.iiasa.Connection("IXSE_SR15")
     variables_to_fetch = ["Emissions*"]
     for model in valid_model_ids:
         print("Fetching data for {}".format(model))
@@ -439,3 +462,50 @@ def _adjust_time_style_to_match(in_df, target_df):
         return pyam.IamDataFrame(in_df)
 
     return in_df
+
+
+def _construct_consistent_values(aggregate_name, components, db_to_generate):
+    """
+    Calculates the sum of the components and creates an IamDataFrame with this
+    value under variable type `aggregate_name`.
+
+    Parameters
+    ----------
+    aggregate_name : str
+        The name of the aggregate variable.
+
+    components : [str]
+        List of the names of the variables to be summed.
+
+    db_to_generate : :obj:`pyam.IamDataFrame`
+        Input data from which to construct consistent values.
+
+    Returns
+    -------
+    :obj:`pyam.IamDataFrame`
+        Consistently calculated aggregate data.
+    """
+    assert (
+        aggregate_name not in db_to_generate.variables().values
+    ), "We already have a variable of this name"
+    relevant_db = db_to_generate.filter(variable=components)
+    units = relevant_db.data["unit"].drop_duplicates().sort_values()
+    unit_equivs = units.map(lambda x: x.replace("-equiv", "")).drop_duplicates()
+    if len(unit_equivs) == 0:
+        raise ValueError(
+            "Attempting to construct a consistent {} but none of the components "
+            "present".format(aggregate_name)
+        )
+    elif len(unit_equivs) > 1:
+        raise ValueError(
+            "Too many units found to make a consistent {}".format(aggregate_name)
+        )
+    use = (
+        relevant_db.data.groupby(["model", "scenario", "region", relevant_db.time_col])
+        .agg("sum")
+        .reset_index()
+    )
+    # Units are sorted in alphabetical order so we choose the first to get -equiv
+    use["unit"] = units.iloc[0]
+    use["variable"] = aggregate_name
+    return pyam.IamDataFrame(use)

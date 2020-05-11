@@ -2,18 +2,19 @@ import re
 
 import numpy as np
 import pandas as pd
+import pyam
 import pytest
 from base import _DataBaseCruncherTester
-from pyam import concat
+from pyam import IamDataFrame, concat
 
-from silicone.database_crunchers import DatabaseCruncherRMSClosest
+from silicone.database_crunchers import RMSClosest
 from silicone.database_crunchers.rms_closest import _select_closest
 
 _msa = ["model_a", "scen_a"]
 
 
 class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
-    tclass = DatabaseCruncherRMSClosest
+    tclass = RMSClosest
     tdb = pd.DataFrame(
         [
             _msa + ["World", "Emissions|HFC|C5F12", "kt C5F12/yr", np.nan, 3.14],
@@ -244,8 +245,13 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
         with pytest.raises(ValueError, match=error_msg):
             filler(test_downscale_df)
 
-    def test_relationship_bad_data(self, bad_df, test_downscale_df):
-        tcruncher = self.tclass(bad_df)
+    def test_relationship_no_infiller_infillee_time_overlap(
+        self, bad_df, test_downscale_df
+    ):
+        odd_times = bad_df.copy()
+        odd_times["scenario"].iloc[0] = "scen_d"
+        odd_times["model"].iloc[0] = "model_b"
+        tcruncher = self.tclass(odd_times)
 
         filler = tcruncher.derive_relationship(
             "Emissions|HFC|C5F12", ["Emissions|HFC|C2F6"]
@@ -253,6 +259,16 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
         error_msg = "No time series overlap between the original and unfilled data"
         with pytest.raises(ValueError, match=error_msg):
             filler(test_downscale_df)
+
+    def test_relationship_no_infiller_time_overlap(self, bad_df, test_downscale_df):
+        tcruncher = self.tclass(bad_df)
+        error_msg = re.escape(
+            "No model/scenario overlap between leader and follower data"
+        )
+        with pytest.raises(ValueError, match=error_msg):
+            filler = tcruncher.derive_relationship(
+                "Emissions|HFC|C5F12", ["Emissions|HFC|C2F6"]
+            )
 
     def test_relationship_complex_usage(self, larger_df, test_downscale_df):
         tcruncher = self.tclass(larger_df)
@@ -283,8 +299,7 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
     def test_derive_relationship_error_multiple_lead_vars(self, test_db):
         tcruncher = self.tclass(test_db)
         error_msg = re.escape(
-            "For `DatabaseCruncherRMSClosest`, ``variable_leaders`` should only "
-            "contain one variable"
+            "For `RMSClosest`, ``variable_leaders`` should only " "contain one variable"
         )
         with pytest.raises(ValueError, match=error_msg):
             tcruncher.derive_relationship("Emissions|HFC|C5F12", ["a", "b"])
@@ -301,6 +316,20 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
         with pytest.raises(ValueError, match=error_msg):
             tcruncher.derive_relationship("Emissions|HFC|C5F12", variable_leaders)
 
+    def test_derive_relationship_error_no_overlap(self, test_db):
+        # test that crunching fails if there's no data about the lead gas in the
+        # database
+        variable_leaders = ["Emissions|HFC|C2F6"]
+        db_no_overlap_m = test_db.copy()
+        db_no_overlap_m["model"].loc[2] = "different model"
+        db_no_overlap_m = IamDataFrame(db_no_overlap_m.data)
+        tcruncher = self.tclass(db_no_overlap_m)
+        error_msg = re.escape(
+            "No model/scenario overlap between leader and follower data"
+        )
+        with pytest.raises(ValueError, match=error_msg):
+            tcruncher.derive_relationship("Emissions|HFC|C5F12", variable_leaders)
+
     def test_derive_relationship_error_no_info_follower(self, test_db):
         # test that crunching fails if there's no data about the follower gas in the
         # database
@@ -313,14 +342,19 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
         with pytest.raises(ValueError, match=error_msg):
             tcruncher.derive_relationship(variable_follower, ["Emissions|HFC|C2F6"])
 
-    def test_relationship_usage(self, test_db, test_downscale_df):
+    @pytest.mark.parametrize("add_col", [None, "extra_col"])
+    def test_relationship_usage(self, test_db, test_downscale_df, add_col):
         tcruncher = self.tclass(test_db)
-
-        filler = tcruncher.derive_relationship(
-            "Emissions|HFC|C5F12", ["Emissions|HFC|C2F6"]
-        )
+        lead = ["Emissions|HFC|C2F6"]
+        follow = "Emissions|HFC|C5F12"
+        filler = tcruncher.derive_relationship(follow, lead)
 
         test_downscale_df = self._adjust_time_style_to_match(test_downscale_df, test_db)
+        if add_col:
+            add_col_val = "blah"
+            test_downscale_df[add_col] = add_col_val
+            test_downscale_df = IamDataFrame(test_downscale_df.data)
+            assert test_downscale_df.extra_cols[0] == add_col
         res = filler(test_downscale_df)
 
         scen_b_df = test_db.filter(variable="Emissions|HFC|C5F12")
@@ -329,6 +363,11 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
         scen_b_df["scenario"] = "scen_b"
         scen_c_df["model"] = "model_b"
         scen_c_df["scenario"] = "scen_c"
+        if add_col:
+            scen_c_df[add_col] = add_col_val
+            scen_c_df = IamDataFrame(scen_c_df.data)
+            scen_b_df[add_col] = add_col_val
+            scen_b_df = IamDataFrame(scen_b_df.data)
         exp = concat([scen_b_df, scen_c_df])
 
         pd.testing.assert_frame_equal(
@@ -340,6 +379,12 @@ class TestDatabaseCruncherRMSClosest(_DataBaseCruncherTester):
             res.timeseries().columns.values.squeeze(),
             exp.timeseries().columns.values.squeeze(),
         )
+
+        # Test we can append the answer to the original
+        appended_df = test_downscale_df.filter(variable=lead).append(res)
+        assert appended_df.filter(variable=follow).equals(res)
+        if add_col:
+            assert all(appended_df.filter(variable=follow)[add_col] == add_col_val)
 
     def test_relationship_usage_no_overlap(self, test_db, test_downscale_df):
         tcruncher = self.tclass(test_db.filter(year=2015))

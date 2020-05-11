@@ -11,7 +11,7 @@ from .base import _DatabaseCruncher
 logger = logging.getLogger(__name__)
 
 
-class DatabaseCruncherConstantRatio(_DatabaseCruncher):
+class ConstantRatio(_DatabaseCruncher):
     """
     Database cruncher which uses the 'constant given ratio' technique.
 
@@ -73,13 +73,13 @@ class DatabaseCruncherConstantRatio(_DatabaseCruncher):
         """
         if len(variable_leaders) > 1:
             raise ValueError(
-                "For `DatabaseCruncherConstantRatio`, ``variable_leaders`` should only "
+                "For `ConstantRatio`, ``variable_leaders`` should only "
                 "contain one variable"
             )
 
         def filler(in_iamdf):
             """
-            Filler function derived from :obj:`DatabaseCruncherTimeDepRatio`.
+            Filler function derived from :obj:`TimeDepRatio`.
 
             Parameters
             ----------
@@ -96,18 +96,14 @@ class DatabaseCruncherConstantRatio(_DatabaseCruncher):
             ValueError
                 The key year for filling is not in ``in_iamdf``.
             """
-            lead_var = in_iamdf.filter(variable=variable_leaders)
+            output_ts = in_iamdf.filter(variable=variable_leaders)
             assert (
-                lead_var["unit"].nunique() == 1
+                output_ts["unit"].nunique() == 1
             ), "There are multiple units for the lead variable."
-            times_needed = set(in_iamdf.data[in_iamdf.time_col])
-            output_ts = lead_var.timeseries()
-            for year in times_needed:
-                output_ts[year] = output_ts[year] * ratio
-            output_ts.reset_index(inplace=True)
+            output_ts["value"] = output_ts["value"] * ratio
             output_ts["variable"] = variable_follower
             output_ts["unit"] = units
 
-            return IamDataFrame(output_ts)
+            return output_ts
 
         return filler

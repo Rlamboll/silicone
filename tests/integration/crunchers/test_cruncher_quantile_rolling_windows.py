@@ -1,4 +1,5 @@
 import datetime as dt
+import logging
 import re
 
 import numpy as np
@@ -9,7 +10,7 @@ from base import _DataBaseCruncherTester
 from pyam import IamDataFrame
 
 import silicone.stats
-from silicone.database_crunchers import DatabaseCruncherQuantileRollingWindows
+from silicone.database_crunchers import QuantileRollingWindows
 
 _ma = "model_a"
 _mb = "model_b"
@@ -31,7 +32,7 @@ _msrvu = ["model", "scenario", "region", "variable", "unit"]
 
 
 class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
-    tclass = DatabaseCruncherQuantileRollingWindows
+    tclass = QuantileRollingWindows
     # The units in this dataframe are intentionally illogical for C5F12
     tdb = pd.DataFrame(
         [
@@ -113,61 +114,205 @@ class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
                 "Emissions|CO2", ["Emissions|CH4", "Emissions|HFC|C5F12"]
             )
 
-    def test_relationship_usage(self, simple_df):
+    @pytest.mark.parametrize("use_ratio", [True, False])
+    def test_relationship_usage(self, simple_df, use_ratio, caplog):
+        # This tests that using the cruncher for a simple case (no averages, just
+        # choosing one of two values) produces the expected results. We test the
+        # quantiles that should result in a flip between the two states.
         tcruncher = self.tclass(simple_df)
+        quant = 0.58
         res = tcruncher.derive_relationship(
-            "Emissions|CO2", ["Emissions|CH4"], quantile=0.833, nwindows=1
+            "Emissions|CO2",
+            ["Emissions|CH4"],
+            quantile=quant,
+            nwindows=2,
+            use_ratio=use_ratio,
         )
-        expect_01 = res(simple_df)
-        assert expect_01.filter(scenario="scen_a", year=2010)["value"].iloc[0] == 0
-        assert expect_01.filter(scenario="scen_b", year=2010)["value"].iloc[0] == 1
-        assert all(expect_01.filter(year=2030)["value"] == 1000)
-        assert all(expect_01.filter(year=2050)["value"] == 5000)
+        with caplog.at_level(logging.INFO, logger="silicone.database_crunchers"):
+            returned = res(simple_df)
+        if use_ratio:
+            # We have a 0/0*0 in the calculation, so error message happens and 0 is
+            # infilled.
+            assert len(caplog.record_tuples) == 1
+            assert returned.filter(scenario="scen_a", year=2010)["value"].iloc[0] == 0
+        else:
+            assert len(caplog.record_tuples) == 0
+            # For the window centre at lead value of 0, given that default
+            # decay_length_factor is 1, the follower value of 1,
+            # which is also at a lead value of 1 and hence  an entire window away,
+            # receives a weight of 1/5 relative to the follower value of 0, which
+            # is at a lead value of zero i.e. the window centre.
+            # unnormalised weights are hence: [1, 0.2]
+            # normalised weights are: [5/6, 1/6]
+            # cumulative weights are hence: [5/6, 1]
+            # subtracting half the weights we get: [5/12, 11/12]
+            # Hence between quantiles of 5/12 and 11/12, we have a gradient (in
+            # follower value - quantile space) = (1 - 0) / (5/12 - 11/12) = 2
+            # thus our relationship is (quant - 5/12) * 2
+            assert np.isclose(
+                returned.filter(scenario="scen_a", year=2010)["value"].iloc[0],
+                (quant - 5 / 12) * 2,
+            )
 
-        # Due to weighting the points (0, 1) at 1:5, if the mathematics is working out
-        # as expected, quantiles above 5/6 will return 1 for the first case.
-        res = tcruncher.derive_relationship(
-            "Emissions|CO2", ["Emissions|CH4"], quantile=0.834, nwindows=1
+        # For the window centre at lead value of 1, given that default
+        # decay_length_factor is 1, the follower value of 0,
+        # which is also at a lead value of 0 and hence  an entire window away,
+        # receives a weight of 1/5 relative to the follower value of 0, which
+        # is at a lead value of zero i.e. the window centre.
+        # unnormalised weights are hence: [0.2, 1]
+        # normalised weights are: [1/6, 5/6]
+        # cumulative weights are hence: [1/6, 1]
+        # subtracting half the weights we get: [1/12, 7/12]
+        # Hence between quantiles of 1/12 and 7/12, we have a gradient (in
+        # follower value - quantile space) = (1 - 0) / (7/12 - 1/12) = 2
+        # thus our relationship is (quant - 1/12) * 2
+        assert np.isclose(
+            returned.filter(scenario="scen_b", year=2010)["value"].iloc[0],
+            (quant - 1 / 12) * 2,
         )
-        expect_11 = res(simple_df)
-        assert expect_11.filter(scenario="scen_a", year=2010)["value"].iloc[0] == 1
-        assert expect_11.filter(scenario="scen_b", year=2010)["value"].iloc[0] == 1
-        assert all(expect_11.filter(year=2030)["value"] == 1000)
-        assert all(expect_11.filter(year=2050)["value"] == 5000)
+        assert all(returned.filter(year=2030)["value"] == 1000)
+        assert all(returned.filter(year=2050)["value"] == 5000)
 
-        # Similarly quantiles below 1/6 are 0 for the second case.
+        # Now repeat with a higher quantile. This time we are too high in the second
+        # case.
+        quant = 0.59
         res = tcruncher.derive_relationship(
-            "Emissions|CO2", ["Emissions|CH4"], quantile=0.165, nwindows=1
+            "Emissions|CO2", ["Emissions|CH4"], quantile=quant, nwindows=2
         )
-        expect_00 = res(simple_df)
+        result_2 = res(simple_df)
+        assert np.isclose(
+            result_2.filter(scenario="scen_a", year=2010)["value"].iloc[0],
+            (quant - 5 / 12) * 2,
+        )
+        assert np.isclose(
+            result_2.filter(scenario="scen_b", year=2010)["value"].iloc[0], 1,
+        )
+        assert all(result_2.filter(year=2030)["value"] == 1000)
+        assert all(result_2.filter(year=2050)["value"] == 5000)
+
+        # Similarly quantiles below 1/12 are 0.
+        res = tcruncher.derive_relationship(
+            "Emissions|CO2", ["Emissions|CH4"], quantile=0.083, nwindows=2
+        )
+        with caplog.at_level(logging.INFO, logger="silicone.database_crunchers"):
+            expect_00 = res(simple_df)
+        if use_ratio:
+            # We have 0/0*0, so no value appears.
+            assert len(caplog.record_tuples) == 1
+        else:
+            assert len(caplog.record_tuples) == 0
         assert expect_00.filter(scenario="scen_a", year=2010)["value"].iloc[0] == 0
         assert expect_00.filter(scenario="scen_b", year=2010)["value"].iloc[0] == 0
         assert all(expect_00.filter(year=2030)["value"] == 1000)
         assert all(expect_00.filter(year=2050)["value"] == 5000)
 
-    def test_numerical_relationship(self):
+    @pytest.mark.parametrize("use_ratio", [True, False])
+    def test_numerical_relationship(self, use_ratio):
         # Calculate the values using the cruncher for a fairly detailed dataset
-        large_db = IamDataFrame(self.large_db.copy())
-        tcruncher = self.tclass(large_db)
-        res = tcruncher.derive_relationship("Emissions|CH4", ["Emissions|CO2"])
+        larger_db = IamDataFrame(self.large_db)
+        larger_db["model"] = larger_db["model"] + "_2"
+        larger_db["value"] = larger_db["value"] - 0.5
+        larger_db.append(IamDataFrame(self.large_db), inplace=True)
+        larger_db = IamDataFrame(larger_db.data)
+        tcruncher = self.tclass(larger_db)
+        res = tcruncher.derive_relationship(
+            "Emissions|CH4", ["Emissions|CO2"], use_ratio=use_ratio
+        )
         assert callable(res)
         to_find = IamDataFrame(self.small_db.copy())
         crunched = res(to_find)
 
         # Calculate the same values numerically
-        xs = large_db.filter(variable="Emissions|CO2")["value"].values
-        ys = large_db.filter(variable="Emissions|CH4")["value"].values
+        xs = larger_db.filter(variable="Emissions|CO2")["value"].values
+        ys = larger_db.filter(variable="Emissions|CH4")["value"].values
+        if use_ratio:
+            ys = ys / xs
         quantile_expected = silicone.stats.rolling_window_find_quantiles(xs, ys, [0.5])
         interpolate_fn = scipy.interpolate.interp1d(
-            np.array(quantile_expected.index), quantile_expected.values.squeeze()
+            np.array(quantile_expected.index), quantile_expected.values.squeeze(),
         )
         xs_to_interp = to_find.filter(variable="Emissions|CO2")["value"].values
-
-        expected = interpolate_fn(xs_to_interp)
-
+        if use_ratio:
+            expected = interpolate_fn(xs_to_interp) * xs_to_interp
+        else:
+            expected = interpolate_fn(xs_to_interp)
         assert all(crunched["value"].values == expected)
 
-    def test_extreme_values_relationship(self):
+    def test_reordering_values_produces_no_change(self, test_db):
+        # We ensure that re-ordering does not change the data. We construct a df
+        # with x = [0, 1, 0, 1], y = [0, 1, 1, 0] and then one
+        # with x = [0, 0, 1, 1], y = [0, 1, 0, 1]
+        time = test_db[test_db.time_col][0]
+        regular_db = IamDataFrame(
+            pd.DataFrame(
+                [[_ma, str(val), "World", _ech4, _mtch4, val] for val in range(2)]
+                + [[_ma, str(val), "World", _eco2, _gtc, val] for val in range(2)]
+                + [[_mb, str(-val), "World", _ech4, _mtch4, val] for val in range(2)]
+                + [[_mb, str(-val), "World", _eco2, _gtc, 1 - val] for val in range(2)],
+                columns=_msrvu + [time],
+            )
+        )
+        irreg_db = IamDataFrame(
+            pd.DataFrame(
+                [[_ma, str(val), "World", _ech4, _mtch4, 0] for val in range(2)]
+                + [[_ma, str(val), "World", _eco2, _gtc, val] for val in range(2)]
+                + [[_mb, str(-val), "World", _ech4, _mtch4, 1] for val in range(2)]
+                + [[_mb, str(-val), "World", _eco2, _gtc, val] for val in range(2)],
+                columns=_msrvu + [time],
+            )
+        )
+        test_db["value"][test_db["value"] > 50] = (
+            test_db["value"][test_db["value"] > 50] / 100
+        )
+        if test_db.time_col == "year":
+            test_db.filter(year=int(time), inplace=True)
+        else:
+            test_db.filter(time=time, inplace=True)
+        regular_db = self._adjust_time_style_to_match(regular_db, test_db)
+        tcruncher = self.tclass(regular_db)
+        infilled_reg = tcruncher.derive_relationship(_eco2, [_ech4], 0.67)(test_db)
+
+        tcruncher = self.tclass(irreg_db)
+        infilled_inv = tcruncher.derive_relationship(_eco2, [_ech4], 0.67)(test_db)
+        assert infilled_inv.equals(infilled_reg)
+
+    def test_limit_of_similar_xs(self, test_db):
+        # Check that the function returns the correct behaviour in the limit of similar
+        # lead values. We construct a db for exactly identical CH4 and for near-
+        # identical CH4 (one point is far away and in the wrong direction).
+        range_db = pd.DataFrame(
+            [[_ma, str(val), "World", _ech4, _gtc, val] for val in range(10)],
+            columns=_msrvu + [2010],
+        )
+        range_db = IamDataFrame(range_db)
+        range_db = self._adjust_time_style_to_match(range_db, test_db)
+        same_db = range_db.copy()
+        same_db["variable"] = _eco2
+        same_db["value"] = 1
+        same_db.append(range_db, inplace=True)
+        nearly_same_db = same_db.copy()
+        # We change the value of one point on the nearly_same and remove it on the same
+        nearly_same_db.data["value"].iloc[1] = 0
+        same_db.filter(scenario="0", keep=False, inplace=True)
+        same_db = IamDataFrame(same_db.data)
+        nearly_same_db = IamDataFrame(nearly_same_db.data)
+        # Derive crunchers and compare results from the two values
+        same_cruncher = self.tclass(same_db)
+        nearly_same_cruncher = self.tclass(nearly_same_db)
+        if test_db.time_col == "year":
+            single_date_df = test_db.filter(year=int(same_db[same_db.time_col][0]))
+        else:
+            single_date_df = test_db.filter(time=(same_db[same_db.time_col][0]))
+        # We choose the case model a, which has only values over 1.
+        single_date_df.filter(model=_mb, scenario=_sa, keep=False, inplace=True)
+        same_res = same_cruncher.derive_relationship(_ech4, [_eco2])(single_date_df)
+        nearly_same_res = nearly_same_cruncher.derive_relationship(_ech4, [_eco2])(
+            single_date_df
+        )
+        assert np.allclose(same_res["value"], nearly_same_res["value"], rtol=5e-4)
+
+    @pytest.mark.parametrize("add_col", [None, "extra_col"])
+    def test_extreme_values_relationship(self, add_col):
         # Our cruncher has a closest-point extrapolation algorithm and therefore
         # should return the same values when filling for data outside tht limits of
         # its cruncher
@@ -175,8 +320,15 @@ class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
         # Calculate the values using the cruncher for a fairly detailed dataset
         large_db = IamDataFrame(self.large_db.copy())
         tcruncher = self.tclass(large_db)
-        res = tcruncher.derive_relationship("Emissions|CH4", ["Emissions|CO2"])
+        lead = ["Emissions|CO2"]
+        follow = "Emissions|CH4"
+        res = tcruncher.derive_relationship(follow, lead)
         assert callable(res)
+        if add_col:
+            add_col_val = "blah"
+            large_db[add_col] = add_col_val
+            large_db = IamDataFrame(large_db.data)
+            assert large_db.extra_cols[0] == add_col
         crunched = res(large_db)
 
         # Increase the maximum values
@@ -191,6 +343,12 @@ class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
         modify_extreme_db["value"].loc[ind] -= 10
         extreme_crunched = res(modify_extreme_db)
         assert all(crunched["value"] == extreme_crunched["value"])
+
+        # Check that we can append the answer
+        appended_df = large_db.filter(variable=lead).append(crunched)
+        assert appended_df.filter(variable=follow).equals(crunched)
+        if add_col:
+            assert all(appended_df[add_col] == add_col_val)
 
     def test_derive_relationship_same_gas(self, test_db, test_downscale_df):
         # Given only a single data series, we recreate the original pattern
@@ -253,11 +411,11 @@ class TestDatabaseCruncherRollingWindows(_DataBaseCruncherTester):
                 "Emissions|CH4", ["Emissions|CO2"], quantile=quantile
             )
 
-    @pytest.mark.parametrize("nwindows", (1.1, 3.1, 101.2))
+    @pytest.mark.parametrize("nwindows", (1.1, 1, 101.2))
     def test_derive_relationship_nwindows_not_integer(self, test_db, nwindows):
         tcruncher = self.tclass(test_db)
         error_msg = re.escape(
-            "Invalid nwindows ({}), it must be an integer".format(nwindows)
+            "Invalid nwindows ({}), it must be an integer > 1".format(nwindows)
         )
 
         with pytest.raises(ValueError, match=error_msg):

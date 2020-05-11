@@ -26,8 +26,8 @@ Silicone
     :maxdepth: 2
     :caption: API reference
 
-    cli
     database-crunchers
+    multiple-infillers
     stats
     utils
 

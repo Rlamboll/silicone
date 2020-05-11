@@ -2,6 +2,8 @@
 Module for the database cruncher which uses the 'time-dependent ratio' technique.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from pyam import IamDataFrame
@@ -9,7 +11,7 @@ from pyam import IamDataFrame
 from .base import _DatabaseCruncher
 
 
-class DatabaseCruncherTimeDepRatio(_DatabaseCruncher):
+class TimeDepRatio(_DatabaseCruncher):
     """
     Database cruncher which uses the 'time-dependent ratio' technique.
 
@@ -17,25 +19,31 @@ class DatabaseCruncherTimeDepRatio(_DatabaseCruncher):
     that the follower timeseries is equal to the lead timeseries multiplied by a
     time-dependent scaling factor. The scaling factor is the ratio of the
     follower variable to the lead variable. If the database contains many such pairs,
-    the scaling factor is the ratio between the means of the values.
+    the scaling factor is the ratio between the means of the values. By default, the
+    calculation will include only values where the lead variable takes the same sign
+    (+ or -) in the infilling database as in the case infilled. This prevents getting
+    negative values of emissions that cannot be negative. To allow cases where we
+    have no data of the correct sign, set `same_sign = False` in `derive_relationship`.
 
     Once the relationship is derived, the 'filler' function will infill following:
 
     .. math::
-        E_f(t) = s(t) * E_l(t)
+        E_f(t) = R(t) * E_l(t)
 
     where :math:`E_f(t)` is emissions of the follower variable and :math:`E_l(t)` is
     emissions of the lead variable.
 
-    :math:`s(t)` is the scaling factor, calculated as the ratio of the means of the
-    the follower and the leader in the cruncher in the database.
+    :math:`R(t)` is the scaling factor, calculated as the ratio of the means of the
+    the follower and the leader in the infiller database, denoted with
+    lower case e. By default, we include only cases where `sign(e_l(t))` is the same in
+    both databases).
 
     .. math::
-        s(t) = \\frac{mean( E_f(t) )}{mean( E_l(t) )})
+        R(t) = \\frac{mean( e_f(t) )}{mean( e_l(t) )})
 
     """
 
-    def derive_relationship(self, variable_follower, variable_leaders):
+    def derive_relationship(self, variable_follower, variable_leaders, same_sign=True):
         """
         Derive the relationship between two variables from the database.
 
@@ -48,6 +56,12 @@ class DatabaseCruncherTimeDepRatio(_DatabaseCruncher):
         variable_leaders : list[str]
             The variable we want to use in order to infer timeseries of
             ``variable_follower`` (e.g. ``["Emissions|CO2"]``).
+
+        same_sign : bool
+            Do we want to only use data where the leader has the same sign in the
+            infiller and infillee data? If so, we have a potential error from
+            not having data of the correct sign, but have more confidence in the
+            sign of the follower data.
 
         Returns
         -------
@@ -86,15 +100,31 @@ class DatabaseCruncherTimeDepRatio(_DatabaseCruncher):
             raise ValueError(error_msg)
         # Calculate the ratios to use
         all_times = np.unique(iamdf_leader.data[iamdf_leader.time_col])
-        scaling = pd.Series(index=all_times)
-        for year in all_times:
-            scaling[year] = np.mean(data_follower[year].values) / np.mean(
-                data_leader[year].values
-            )
+        scaling = pd.DataFrame(index=all_times, columns=["pos", "neg"])
+        if same_sign:
+            # We want to have separate positive and negative answers. We calculate a
+            # tuple, first for positive and then negative values.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for year in all_times:
+                    pos_inds = data_leader[year].values > 0
+                    scaling["pos"][year] = np.nanmean(
+                        data_follower[year].iloc[pos_inds].values
+                    ) / np.nanmean(data_leader[year].iloc[pos_inds].values)
+                    scaling["neg"][year] = np.nanmean(
+                        data_follower[year].iloc[~pos_inds].values
+                    ) / np.nanmean(data_leader[year].iloc[~pos_inds].values)
+        else:
+            # The tuple is the same in both cases
+            for year in all_times:
+                scaling["pos"][year] = np.mean(data_follower[year].values) / np.mean(
+                    data_leader[year].values
+                )
+            scaling["neg"] = scaling["pos"]
 
         def filler(in_iamdf):
             """
-            Filler function derived from :obj:`DatabaseCruncherTimeDepRatio`.
+            Filler function derived from :obj:`TimeDepRatio`.
 
             Parameters
             ----------
@@ -137,7 +167,25 @@ class DatabaseCruncherTimeDepRatio(_DatabaseCruncher):
             output_ts = lead_var.timeseries()
 
             for year in times_needed:
-                output_ts[year] = output_ts[year] * scaling[year]
+                if (
+                    scaling.loc[year][
+                        output_ts[year].map(lambda x: "neg" if x < 0 else "pos")
+                    ]
+                    .isnull()
+                    .values.any()
+                ):
+                    raise ValueError(
+                        "Attempt to infill {} data using the time_dep_ratio cruncher "
+                        "where the infillee data has a sign not seen in the infiller "
+                        "database for year "
+                        "{}.".format(variable_leaders, year)
+                    )
+                output_ts[year] = (
+                    output_ts[year].values
+                    * scaling.loc[year][
+                        output_ts[year].map(lambda x: "pos" if x > 0 else "neg")
+                    ].values
+                )
             output_ts.reset_index(inplace=True)
             output_ts["variable"] = variable_follower
             output_ts["unit"] = data_follower_unit
@@ -149,7 +197,7 @@ class DatabaseCruncherTimeDepRatio(_DatabaseCruncher):
     def _get_iamdf_followers(self, variable_follower, variable_leaders):
         if len(variable_leaders) > 1:
             raise ValueError(
-                "For `DatabaseCruncherTimeDepRatio`, ``variable_leaders`` should only "
+                "For `TimeDepRatio`, ``variable_leaders`` should only "
                 "contain one variable"
             )
 

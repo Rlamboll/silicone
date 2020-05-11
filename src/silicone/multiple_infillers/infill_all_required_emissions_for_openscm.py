@@ -2,12 +2,12 @@ import logging
 import re
 import warnings
 
+import pandas as pd
 import pyam
 import tqdm
-from silicone.database_crunchers import (
-    DatabaseCruncherQuantileRollingWindows,
-    DatabaseCruncherConstantRatio,
-)
+
+from silicone.database_crunchers import ConstantRatio, QuantileRollingWindows
+
 
 """
 Infills all required data for MAGICC and FAIR emulators with minimal configuration 
@@ -19,11 +19,12 @@ def infill_all_required_variables(
     database,
     variable_leaders,
     required_variables_list=None,
-    cruncher=DatabaseCruncherQuantileRollingWindows,
+    cruncher=QuantileRollingWindows,
     output_timesteps=None,
     infilled_data_prefix=None,
     to_fill_old_prefix=None,
     check_data_returned=False,
+    **kwargs,
 ):
     """
     This is function designed to infill all required data given a minimal amount of
@@ -49,7 +50,7 @@ def infill_all_required_variables(
 
     cruncher : :class:
         The class of cruncher to use to compute the infilled values. Defaults to
-        DatabaseCruncherQuantileRollingWindows, which uses the median value of a rolling
+        QuantileRollingWindows, which uses the median value of a rolling
         window. See the cruncher documentation for more details.
 
     output_timesteps : list[int or datetime]
@@ -70,6 +71,9 @@ def infill_all_required_variables(
         reasons for failing this include requesting results at times outside our input
         time range, as well as code bugs.
 
+    ** kwargs :
+        An optional dictionary of keyword : arguments to be used with the cruncher.
+
     Returns
     -------
     :obj:`pyam.IamDataFrame`
@@ -78,7 +82,13 @@ def infill_all_required_variables(
     """
     # Use default arguments for unfilled options:
     if output_timesteps is None:
+        if to_fill.time_col == "time":
+            raise ValueError(
+                "No default behaviour for output_timesteps when dataframe has time "
+                "column instead of years"
+            )
         output_timesteps = [2015] + list(range(2020, 2101, 10))
+
     if required_variables_list is None:
         required_variables_list = [
             "Emissions|BC",
@@ -140,17 +150,22 @@ def infill_all_required_variables(
     to_fill_times_missing = to_fill.timeseries().isna().sum() > 0
     for time in output_timesteps:
         if time not in database[timecol].tolist() or df_times_missing[time]:
-            # TODO: ensure that this works with date-times too.
             database.interpolate(time)
         if time not in to_fill[timecol].tolist() or to_fill_times_missing[time]:
             to_fill.interpolate(time)
+    # Nans in additional columns break pyam, so we overwrite them
+    database.data[database.extra_cols] = database.data[database.extra_cols].fillna(0)
+    to_fill.data[to_fill.extra_cols] = to_fill.data[to_fill.extra_cols].fillna(0)
     # Filter for desired times
     if timecol == "year":
         database = database.filter(year=output_timesteps)
         to_fill = to_fill.filter(year=output_timesteps)
     else:
-        database = database.filter(time=output_timesteps)
-        to_fill = to_fill.filter(time=output_timesteps)
+        # TODO: this filter switchup is needed because of a problem with filter.
+        #  If the pyam bug clears we can remove it.
+        output_timesteps_datetime = pd.to_datetime(output_timesteps)
+        database = database.filter(time=output_timesteps_datetime)
+        to_fill = to_fill.filter(time=output_timesteps_datetime)
     # Infill unavailable data
     assert not database.data.isnull().any().any()
     assert not to_fill.data.isnull().any().any()
@@ -160,7 +175,13 @@ def infill_all_required_variables(
         if variab not in database.variables().values
     ]
     if unavailable_variables:
-        warnings.warn(UserWarning("No data for {}".format(unavailable_variables)))
+        warnings.warn(
+            UserWarning(
+                "No data for {}, it will be infilled with 0s".format(
+                    unavailable_variables
+                )
+            )
+        )
         # Infill the required variables with 0s.
         kwarg_dict = {"ratio": 0, "units": "Mt CO2-equiv/yr"}
         to_fill = _perform_crunch_and_check(
@@ -168,11 +189,11 @@ def infill_all_required_variables(
             variable_leaders,
             to_fill,
             database,
-            DatabaseCruncherConstantRatio,
+            ConstantRatio,
             output_timesteps,
             to_fill_orig,
             check_data_returned=False,
-            **kwarg_dict
+            **kwarg_dict,
         )
     available_variables = [
         variab
@@ -189,6 +210,7 @@ def infill_all_required_variables(
             output_timesteps,
             to_fill_orig,
             check_data_returned=check_data_returned,
+            **kwargs,
         )
     if infilled_data_prefix:
         to_fill.data["variable"] = infilled_data_prefix + "|" + to_fill.data["variable"]
@@ -204,7 +226,7 @@ def _perform_crunch_and_check(
     output_timesteps,
     to_fill_orig,
     check_data_returned=False,
-    **kwargs
+    **kwargs,
 ):
     """
         Takes a list of scenarios to infill and infills them according to the options
@@ -244,12 +266,6 @@ def _perform_crunch_and_check(
         :obj:IamDataFrame
             The infilled dataframe
         """
-    if (
-        not all(x in df.variables().values for x in required_variables)
-        and type_of_cruncher != DatabaseCruncherConstantRatio
-    ):
-        not_present = [x for x in required_variables if x not in df.variables().values]
-        raise Warning("Missing some requested variables: {}".format(not_present))
     cruncher = type_of_cruncher(df)
     for req_var in tqdm.tqdm(required_variables, desc="Filling required variables"):
         interpolated = _infill_variable(cruncher, req_var, leaders, to_fill, **kwargs)
@@ -267,9 +283,18 @@ def _perform_crunch_and_check(
             msvdf_data = msvdf.data
             assert not msvdf_data.isnull().any().any()
             assert not msvdf_data.empty
-            assert all(
-                [y in msvdf_data[df.time_col].values for y in output_timesteps]
-            ), "We do not have data for all required timesteps"
+            if df.time_col == "year":
+                assert all(
+                    [y in msvdf_data[df.time_col].values for y in output_timesteps]
+                ), "We do not have data for all required timesteps"
+            else:
+                output_timesteps_datetime = pd.to_datetime(output_timesteps)
+                assert all(
+                    [
+                        y in msvdf_data[df.time_col].values
+                        for y in output_timesteps_datetime.values
+                    ]
+                ), "We do not have data for all required timesteps"
 
     # Check no data was overwritten by accident
     for model in tqdm.tqdm(
@@ -325,10 +350,8 @@ def _infill_variable(cruncher_i, req_variable, leader_i, to_fill_i, **kwargs):
     filler = cruncher_i.derive_relationship(req_variable, leader_i, **kwargs)
     # only fill for scenarios who don't have that variable
     # quieten logging about empty data frame as it doesn't matter here
-    # TODO: make pyam not use the root logger
-    logging.getLogger().setLevel(logging.CRITICAL)
+    logging.getLogger("pyam.core").setLevel(logging.CRITICAL)
     not_to_fill = to_fill_i.filter(variable=req_variable)
-    logging.getLogger().setLevel(logging.WARNING)
 
     to_fill_var = to_fill_i.copy()
     if not not_to_fill.data.empty:
@@ -337,4 +360,5 @@ def _infill_variable(cruncher_i, req_variable, leader_i, to_fill_i, **kwargs):
     if not to_fill_var.data.empty:
         interpolated = filler(to_fill_var)
         return interpolated
+    logging.getLogger("pyam.core").setLevel(logging.WARNING)
     return None

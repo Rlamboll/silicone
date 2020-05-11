@@ -2,16 +2,20 @@
 Module for the database cruncher which uses the 'rolling windows' technique.
 """
 
+import logging
+
 import numpy as np
-import pandas as pd
 import scipy.interpolate
 from pyam import IamDataFrame
 
-from .base import _DatabaseCruncher
+from ..stats import rolling_window_find_quantiles
 from ..utils import _get_unit_of_variable
+from .base import _DatabaseCruncher
+
+logger = logging.getLogger(__name__)
 
 
-class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
+class QuantileRollingWindows(_DatabaseCruncher):
     """
     Database cruncher which uses the 'rolling windows' technique.
 
@@ -41,23 +45,46 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
     where :math:`x` is the position of the data point on the lead timeseries axis,
     :math:`x_{\\text{window}}` is the position of the centre of the window on the lead
     timeseries axis, :math:`b` is the distance between window centres and :math:`f` is
-    a decay factor which controls how much less points away from :math:`x_{\\
-    text{window}}` are weighted. If :math:`f=1` then a point which is halfway between
-    window centres receives a weighting of :math:`1/2`. Lowering the value of
-    :math:`f` cause points further from the window centre to receive less weight.
+    a decay factor which controls how much less points away from
+    :math:`x_{\\text{window}}` are weighted.
+    If :math:`f=1` then a point which is half the width between window centres away
+    receives a weighting of :math:`1/2`. Lowering the value of :math:`f` cause points
+    further from the window centre to receive less weight.
 
     With these weightings, the desired quantile of the data is then calculated. This
-    calculation is done by sorting the data, and then choosing the first data point
-    from the database which sits above or equal to the given quantile, with each data
-    point's contribution to the quantile calculation being weighted by its weight. As
-    a result, this cruncher limits itself to using data within the distribution and
-    will not make any assumptions about the shape of the distribution.
+    calculation is done by sorting the data by the database's follow timeseries values
+    (then by lead timeseries values in the case of identical follow values). From here,
+    the weight of each point is calculated following the formula given above.
+    We calculate the cumulative sum of weights, and then the cumulative sum up to half
+    weights, defined by
+
+    .. math::
+
+        c_{hw} = c_w - 0.5 \\times w
+
+    where :math:`c_w` is the cumulative weights and :math:`w` is the raw weights. This
+    ensures that quantiles less than half the weight of the smallest follow value return
+    the smallest follow value and more than one minus half the weight of the largest
+    follow value return the largest value. Without such a shift, the largest value is
+    only returned if the quantile is 1, leading to a bias towards smaller values.
+
+    With these calculations, we have determined the relationship between the follow
+    timeseries values and the quantile i.e. cumulative sum of (normalised) weights. We
+    can then determine arbitrary quantiles by linearly interpolating.
+
+    If the option ``use_ratio`` is set to ``True``, instead of returning the absolute
+    value of the follow at this quantile, we return the quantile of the ratio between
+    the lead and follow data in the database, multiplied by the actual lead value of the
+    database being infilled.
 
     By varying the quantile, this cruncher can provide ranges of the relationship
     between different variables. For example, it can provide the 90th percentile (i.e.
     high end) of the relationship between e.g. ``Emissions|CH4`` and ``Emissions|CO2``
     or the 50th percentile (i.e. median) or any other arbitrary percentile/quantile
-    choice.
+    choice. Note that the impact of this will strongly depend on nwindows and
+    decay_length_factor. Using the :class:`TimeDepQuantileRollingWindows` class makes
+    it is possible to specify a dictionary of dates to quantiles, in which case we
+    return that quantile for that year or date.
     """
 
     def derive_relationship(
@@ -65,8 +92,9 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
         variable_follower,
         variable_leaders,
         quantile=0.5,
-        nwindows=10,
+        nwindows=11,
         decay_length_factor=1,
+        use_ratio=False,
     ):
         """
         Derive the relationship between two variables from the database.
@@ -84,15 +112,20 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
         quantile : float
             The quantile to return in each window.
 
-        nboxes : int
-            The number of windows to use when calculating the relationship between the
-            follower and lead gases.
+        nwindows : int
+            The number of window centers to use when calculating the relationship
+            between the follower and lead gases.
 
         decay_length_factor : float
             Parameter which controls how strongly points away from the window's centre
             should be weighted compared to points at the centre. Larger values give
             points further away increasingly less weight, smaller values give points
             further away increasingly more weight.
+
+        use_ratio : bool
+            If false, we use the quantile value of the weighted mean absolute value. If
+            true, we find the quantile weighted mean ratio between lead and follow,
+            then multiply the ratio by the input value.
 
         Returns
         -------
@@ -113,7 +146,7 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
             ``quantile`` is not between 0 and 1.
 
         ValueError
-            ``nwindows`` is not equivalent to an integer.
+            ``nwindows`` is not equivalent to an integer or is not greater than 1.
 
         ValueError
             ``decay_length_factor`` is 0.
@@ -124,9 +157,12 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
             error_msg = "Invalid quantile ({}), it must be in [0, 1]".format(quantile)
             raise ValueError(error_msg)
 
-        if int(nwindows) != nwindows:
-            error_msg = "Invalid nwindows ({}), it must be an integer".format(nwindows)
+        if int(nwindows) != nwindows or nwindows < 2:
+            error_msg = "Invalid nwindows ({}), it must be an integer > 1".format(
+                nwindows
+            )
             raise ValueError(error_msg)
+
         nwindows = int(nwindows)
 
         if np.equal(decay_length_factor, 0):
@@ -141,6 +177,7 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
         wide_db = self._db.filter(
             variable=[variable_follower] + variable_leaders
         ).pivot_table(index=idx, columns=columns, aggfunc="sum")
+
         # make sure we don't have empty strings floating around (pyam bug?)
         wide_db = wide_db.applymap(lambda x: np.nan if isinstance(x, str) else x)
         wide_db = wide_db.dropna(axis=0)
@@ -149,69 +186,66 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
         for db_time, dbtdf in wide_db.groupby(db_time_col):
             xs = dbtdf[variable_leaders].values.squeeze()
             ys = dbtdf[variable_follower].values.squeeze()
+
             if xs.shape != ys.shape:
                 raise NotImplementedError(
                     "Having more than one `variable_leaders` is not yet implemented"
                 )
-
             if not xs.shape:
                 # 0D-array, make 1D
                 xs = np.array([xs])
                 ys = np.array([ys])
 
-            step = (max(xs) - min(xs)) / nwindows
-            decay_length = step / 2 * decay_length_factor
+            if use_ratio:
+                # We want the ratio between x and y, not the actual values of y.
+                ys = ys / xs
+                if np.isnan(ys).any():
+                    logging.warning(
+                        "Undefined values of ratio appear in the quantiles when "
+                        "infilling {}, setting some values to 0 (this may not affect "
+                        "results).".format(variable_follower)
+                    )
+                    ys[np.isnan(ys)] = 0
 
-            sort_order = np.argsort(ys)
-            ys = ys[sort_order]
-            xs = xs[sort_order]
-            if max(xs) == min(xs):
+            if np.equal(max(xs), min(xs)):
                 # We must prevent singularity behaviour if all the points are at the
                 # same x value.
-                cumsum_weights = np.array([(1 + x) / len(ys) for x in range(len(ys))])
+                cumsum_weights = np.array([(0.5 + x) / len(ys) for x in range(len(ys))])
+                ys.sort()
 
                 def same_x_val_workaround(
                     _, ys=ys, cumsum_weights=cumsum_weights, quantile=quantile
                 ):
-                    return min(ys[cumsum_weights >= quantile])
+                    if np.equal(min(ys), max(ys)):
+                        return ys[0]
+                    return scipy.interpolate.interp1d(
+                        cumsum_weights,
+                        ys,
+                        bounds_error=False,
+                        fill_value=(ys[0], ys[-1]),
+                        assume_sorted=True,
+                    )(quantile)
 
                 derived_relationships[db_time] = same_x_val_workaround
+
             else:
-                # We want to include the max x point, but not any point above it.
-                # The 0.99 factor prevents rounding error inclusion.
-                window_centers = np.arange(min(xs), max(xs) + step * 0.99, step)
-
-                db_time_table = pd.DataFrame(
-                    index=pd.MultiIndex.from_arrays(
-                        ([db_time], [quantile]), names=["db_time", "quantile"]
-                    ),
-                    columns=window_centers,
+                db_time_table = rolling_window_find_quantiles(
+                    xs, ys, quantile, nwindows, decay_length_factor
                 )
-                db_time_table.columns.name = "window_centers"
-
-                for window_center in window_centers:
-                    weights = 1.0 / (1.0 + ((xs - window_center) / decay_length) ** 2)
-                    weights /= sum(weights)
-                    # We want to calculate the weights at the midpoint of step corresponding
-                    # to the y-value.
-                    cumsum_weights = np.cumsum(weights)
-                    db_time_table.loc[(db_time, quantile), window_center] = min(
-                        ys[cumsum_weights >= quantile]
-                    )
 
                 derived_relationships[db_time] = scipy.interpolate.interp1d(
-                    db_time_table.columns.values.squeeze(),
-                    db_time_table.loc[(db_time, quantile), :].values.squeeze(),
+                    db_time_table.index.values,
+                    db_time_table.loc[:, quantile].values.squeeze(),
                     bounds_error=False,
                     fill_value=(
-                        db_time_table.loc[(db_time, quantile)].iloc[0],
-                        db_time_table.loc[(db_time, quantile)].iloc[-1],
+                        db_time_table[quantile].iloc[0],
+                        db_time_table[quantile].iloc[-1],
                     ),
                 )
 
         def filler(in_iamdf):
             """
-            Filler function derived from :obj:`DatabaseCruncherQuantileRollingWindows`.
+            Filler function derived from :class:`QuantileRollingWindows`.
 
             Parameters
             ----------
@@ -267,7 +301,12 @@ class DatabaseCruncherQuantileRollingWindows(_DatabaseCruncher):
             # do infilling here
             infilled_ts = in_iamdf.filter(variable=variable_leaders).timeseries()
             for col in infilled_ts:
-                infilled_ts[col] = derived_relationships[col](infilled_ts[col])
+                if use_ratio:
+                    infilled_ts[col] = (
+                        derived_relationships[col](infilled_ts[col]) * infilled_ts[col]
+                    )
+                else:
+                    infilled_ts[col] = derived_relationships[col](infilled_ts[col])
 
             infilled_ts = infilled_ts.reset_index()
             infilled_ts["variable"] = variable_follower

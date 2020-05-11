@@ -8,6 +8,7 @@ KEYWORDS = ["emissions", "automation", "filling", "detail", "climate"]
 AUTHORS = [
     ("Robin Lamboll", "r.lamboll@imperial.ac.uk"),
     ("Zebedee Nicholls", "zebedee.nicholls@climate-energy-college.org"),
+    ("Jarmo Kikstra", "kikstra@iiasa.ac.at"),
 ]
 URL = "https://github.com/znicholls/silicone"
 PROJECT_URLS = {
@@ -29,21 +30,16 @@ CLASSIFIERS = [
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3.6",
     "Programming Language :: Python :: 3.7",
+    # "Programming Language :: Python :: 3.8",
 ]
 
-ENTRY_POINTS = {
-    "console_scripts": [
-        "silicone-explore-quantiles-rolling-windows = silicone.cli:plot_emission_correlations_quantile_rolling_windows_cli"
-    ]
-}
-
 REQUIREMENTS_INSTALL = [
+    "openscm-units>=0.1.1",
+    "pint",
+    "pyam-iamc>=0.5.0",
+    "python-dateutil",
     "numpy",
     "scipy",
-    "pint",
-    "python-dateutil",
-    "pyam-iamc>=0.3.0",
-    "click",
     "tqdm",
 ]
 REQUIREMENTS_NOTEBOOKS = ["notebook", "seaborn", "statsmodels"]
@@ -56,14 +52,24 @@ REQUIREMENTS_TESTS = [
     "pytest-cov",
 ]
 REQUIREMENTS_DOCS = [
-    "sphinx>=1.4,<2.1",
+    "sphinx>2.1",
     "sphinx_rtd_theme",
     "sphinx-autodoc-typehints",
-    "sphinx-click",
 ]
 REQUIREMENTS_DEPLOY = ["setuptools>=38.6.0", "twine>=1.11.0", "wheel>=0.31.0"]
 REQUIREMENTS_DEV = (
-    ["black", "bandit", "coverage", "flake8", "isort", "mypy", "pydocstyle", "pylint"]
+    [
+        "black",
+        "black-nb",
+        "bandit",
+        "coverage",
+        "flake8",
+        "isort",
+        "mypy",
+        "nbdime",
+        "pydocstyle",
+        "pylint",
+    ]
     + REQUIREMENTS_NOTEBOOKS
     + REQUIREMENTS_TESTS
     + REQUIREMENTS_DOCS
@@ -128,5 +134,4 @@ setup(
     install_requires=REQUIREMENTS_INSTALL,
     extras_require=REQUIREMENTS_EXTRAS,
     cmdclass=CMDCLASS,
-    entry_points=ENTRY_POINTS,
 )
